@@ -1,0 +1,26 @@
+# User-specific
+*.user
+*.userosscache
+*.sln.docstates
+
+# Build Results
+[Bb]in/
+[Oo]bj/
+*.userprefs
+*.usertasks
+
+# Visual Studio / IDEs
+.vs/
+.vscode/
+
+# Build and Publish
+*.bak
+*.orig
+*.tmp
+*.log
+*.sqlite
+*.db
+
+# OS specific
+.DS_Store
+Thumbs.db
