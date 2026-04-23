@@ -1,0 +1,61 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:JKDecompiler.UI.ViewModels"
+        xmlns:local="clr-namespace:JKDecompiler.UI.Controls"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
+        x:Class="JKDecompiler.UI.Views.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Icon="/Assets/avalonia-logo.ico"
+        Title="JKDecompiler.UI">
+
+    <Design.DataContext>
+        <!-- This only sets the DataContext for the previewer in an IDE,
+             to set the actual DataContext for runtime, set the DataContext property in code (look at App.axaml.cs) -->
+        <vm:MainWindowViewModel/>
+    </Design.DataContext>
+
+    <DockPanel>
+        <Menu DockPanel.Dock="Top">
+            <MenuItem Header="_File">
+                <MenuItem Header="_Open BSP..." Click="OpenBsp_Click"/>
+                <MenuItem Header="_Export Map..." Click="ExportBsp_Click"/>
+                <Separator/>
+                <MenuItem Header="Set _JKA Path..." Click="SetGamePath_Click"/>
+                <Separator/>
+                <MenuItem Header="_Exit" Click="Exit_Click"/>
+            </MenuItem>
+        </Menu>
+
+        <StackPanel DockPanel.Dock="Bottom" Margin="5" Spacing="5">
+            <ProgressBar IsIndeterminate="{Binding IsExporting}" IsVisible="{Binding IsExporting}" Height="10"/>
+            <StackPanel Orientation="Horizontal" Spacing="10">
+                <TextBlock Text="JKA Path:" VerticalAlignment="Center"/>
+                <TextBlock Text="{Binding GamePath}" VerticalAlignment="Center" FontWeight="Bold"/>
+            </StackPanel>
+            <TextBlock Text="{Binding GamePathStatus}" Foreground="Gray" FontStyle="Italic"/>
+        </StackPanel>
+
+        <TabControl>
+            <TabItem Header="Entities">
+                <DataGrid ItemsSource="{Binding Entities}" AutoGenerateColumns="False" IsReadOnly="True" GridLinesVisibility="All">
+                    <DataGrid.Columns>
+                        <DataGridTextColumn Header="Classname" Binding="{Binding ClassName}" />
+                        <DataGridTextColumn Header="Origin" Binding="{Binding Origin}" />
+                        <DataGridTextColumn Header="Keys" Binding="{Binding KeyValues.Count}" />
+                    </DataGrid.Columns>
+                </DataGrid>
+            </TabItem>
+            <TabItem Header="Models">
+                <ListBox ItemsSource="{Binding ModelIndices}" />
+            </TabItem>
+            <TabItem Header="Scripts">
+                <ListBox ItemsSource="{Binding Scripts}" />
+            </TabItem>
+            <TabItem Header="Missing Assets">
+                <ListBox ItemsSource="{Binding MissingAssets}" />
+            </TabItem>
+        </TabControl>
+    </DockPanel>
+</Window>

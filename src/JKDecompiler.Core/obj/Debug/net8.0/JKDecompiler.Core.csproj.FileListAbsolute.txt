@@ -1,0 +1,11 @@
+C:\repos\geminiProject\src\JKDecompiler.Core\bin\Debug\net8.0\JKDecompiler.Core.deps.json
+C:\repos\geminiProject\src\JKDecompiler.Core\bin\Debug\net8.0\JKDecompiler.Core.dll
+C:\repos\geminiProject\src\JKDecompiler.Core\bin\Debug\net8.0\JKDecompiler.Core.pdb
+C:\repos\geminiProject\src\JKDecompiler.Core\obj\Debug\net8.0\JKDecompiler.Core.GeneratedMSBuildEditorConfig.editorconfig
+C:\repos\geminiProject\src\JKDecompiler.Core\obj\Debug\net8.0\JKDecompiler.Core.AssemblyInfoInputs.cache
+C:\repos\geminiProject\src\JKDecompiler.Core\obj\Debug\net8.0\JKDecompiler.Core.AssemblyInfo.cs
+C:\repos\geminiProject\src\JKDecompiler.Core\obj\Debug\net8.0\JKDecompiler.Core.csproj.CoreCompileInputs.cache
+C:\repos\geminiProject\src\JKDecompiler.Core\obj\Debug\net8.0\JKDecompiler.Core.dll
+C:\repos\geminiProject\src\JKDecompiler.Core\obj\Debug\net8.0\refint\JKDecompiler.Core.dll
+C:\repos\geminiProject\src\JKDecompiler.Core\obj\Debug\net8.0\JKDecompiler.Core.pdb
+C:\repos\geminiProject\src\JKDecompiler.Core\obj\Debug\net8.0\ref\JKDecompiler.Core.dll
