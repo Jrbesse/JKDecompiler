@@ -28,10 +28,16 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ./output/*
+          files: ./artifacts/**/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
