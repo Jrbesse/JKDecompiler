@@ -19,11 +19,20 @@ jobs:
           dotnet-version: 8.0.x
       - name: Build
         run: dotnet publish src/JKDecompiler.UI/JKDecompiler.UI.csproj -c Release -r ${{ matrix.os == 'windows-latest' && 'win-x64' || 'linux-x64' }} --self-contained -o ./output
+      - name: Package (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: powershell
+        run: Compress-Archive -Path ./output/* -DestinationPath ./JKDecompiler-win-x64.zip
+      - name: Package (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: tar -czvf JKDecompiler-linux-x64.tar.gz -C ./output .
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: JKDecompiler-${{ matrix.os }}
-          path: ./output
+          path: |
+            *.zip
+            *.tar.gz
 
   release:
     needs: build
