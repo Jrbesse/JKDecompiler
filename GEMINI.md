@@ -54,23 +54,21 @@ JKA uses a modified version of the Quake 3 BSP format, resetting the version to 
 
 ## Status
 - **Core Parsing**: 100% complete for 18-lump RBSP (JKA).
-- **Exporting**: `.map` exporter with UV Solver, Bezier Patch Restoration, and Detail Brush support complete.
-- **UI**: Entity, Model, ICARUS Script, and Asset inspection (with enhanced PK3/path logic) complete.
+- **Exporting**: `.map` exporter with UV Solver, Bezier Patch Restoration, and Detail Brush support implemented.
+    - *Geometry*: Refactored to plane-based reconstruction to resolve GTKRadiant structural errors.
+    - *Patching*: Added degenerate patch filtering to resolve `safe_malloc` crashes in Q3Map2.
+    - *Texture/Shader Alignment*: Fixed export syntax to adhere to Quake 3/JKA `.map` format.
+- **UI**: Entity, Model, ICARUS Script, and Asset inspection complete.
 - **Testing**: Validated against `t1_sour.bsp`.
-- **Milestone**: MVP complete and ready for Beta release.
-
-## Phase 2: Gold Standard Fidelity & Visualization
-1. [x] **UV Alignment Solver**: Mathematical reconstruction of `(shift, scale, rotate)` from BSP vertex UVs.
-2. [x] **Bezier Patch Restoration**: Converting BSP patches back to Radiant `patchDef2` curve blocks.
-3. [x] **Asset Presence Checker**: Utility to scan for missing textures/models/scripts in the local JKA directory.
-4. [x] **Structural/Detail Preservation**: Automatic detection of brush types via `contentFlags`.
-
-
+- **Known Issues**:
+    - `Winding_BaseForPlane: no axis found` / `Brush_Resize: invalid input` still occur for some brushes in GTKRadiant.
+    - *Investigation ongoing*: Suspect current plane-point derivation logic does not strictly adhere to the expected convex hull vertex format of Radiant.
 
 ## Phase 3: UX Refinement
-1.  [ ] **Asset Checker Refinement**: Improve logic for PK3 asset scanning and path validation.
-2.  [ ] **Export UI Feedback**: Add progress bar/status message for .map export.
-3.  [ ] **3D Hardware Preview**: Integrated 3D view in Avalonia for geometry and entity placement.
+1. [x] **Asset Checker Refinement**: Improve logic for PK3 asset scanning and path validation.
+2. [x] **Export UI Feedback**: Add progress bar/status message for .map export.
+3. [ ] **3D Hardware Preview**: Integrated 3D view in Avalonia for geometry and entity placement.
+4. [ ] **Geometry Integrity**: (High Priority) Solve remaining brush-side winding and vertex definition issues.
 
 
 

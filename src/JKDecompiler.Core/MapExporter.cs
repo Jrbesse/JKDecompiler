@@ -22,11 +22,11 @@ namespace JKDecompiler.Core
 
         private void ExportEntity(BspData data, BspEntity entity, StreamWriter writer, int index)
         {
-            writer.WriteLine($"// entity {index}");
             writer.WriteLine("{");
 
             foreach (var kv in entity.KeyValues)
             {
+                // Ensure key and value are properly quoted
                 writer.WriteLine($"\"{kv.Key}\" \"{kv.Value}\"");
             }
 
@@ -69,24 +69,26 @@ namespace JKDecompiler.Core
             if (face.ShaderIndex < 0 || face.ShaderIndex >= data.Shaders.Count) return;
             if (face.FirstVertexIndex < 0 || face.FirstVertexIndex >= data.Vertices.Count) return;
 
-            writer.WriteLine($"// patch {index}");
+            // Patch must have at least 3x3 vertices to be a valid patch
+            if (face.PatchWidth < 3 || face.PatchHeight < 3) return;
+
             writer.WriteLine("{");
             writer.WriteLine(" patchDef2");
             writer.WriteLine(" {");
 
             var shader = data.Shaders[face.ShaderIndex];
-            writer.WriteLine($"  {shader.Name}");
-            writer.WriteLine($"  ( {face.PatchWidth} {face.PatchHeight} 0 0 0 )");
+            writer.WriteLine($"  {CleanShaderName(shader.Name)}");
+            // Ensure patch dimensions do not exceed GTKRadiant limits (32x32)
+            int exportWidth = Math.Min(face.PatchWidth, 32);
+            int exportHeight = Math.Min(face.PatchHeight, 32);
+            writer.WriteLine($"  ( {exportWidth} {exportHeight} 0 0 0 )");
             writer.WriteLine("  (");
 
-            for (int w = 0; w < face.PatchWidth; w++)
+            for (int h = 0; h < exportHeight; h++)
             {
                 writer.Write("   ( ");
-                for (int h = 0; h < face.PatchHeight; h++)
+                for (int w = 0; w < exportWidth; w++)
                 {
-                    // BSP stores patches in a flat array, but Radiant expects a specific grid layout
-                    // Depending on how JKA orders them, we might need to transpose h and w.
-                    // Usually it's [h * width + w]
                     int vertexIndex = face.FirstVertexIndex + (h * face.PatchWidth + w);
                     if (vertexIndex < 0 || vertexIndex >= data.Vertices.Count)
                     {
@@ -113,22 +115,26 @@ namespace JKDecompiler.Core
             for (int i = 0; i < model.NumBrushes; i++)
             {
                 var brush = data.Brushes[model.FirstBrush + i];
+                writer.WriteLine($"// brush {i}");
                 ExportBrush(data, brush, writer, i);
             }
         }
 
         private void ExportBrush(BspData data, BspBrush brush, StreamWriter writer, int index)
         {
-            writer.WriteLine($"// brush {index}");
+            if (brush.NumSides < 4) return;
+
             writer.WriteLine("{");
 
             bool isDetail = false;
+            // Use a list of exported planes and check similarity instead of just index
+            var exportedPlanes = new List<BspPlane>();
+
             for (int i = 0; i < brush.NumSides; i++)
             {
                 var side = data.BrushSides[brush.FirstSide + i];
                 if (side.ShaderIndex >= 0 && side.ShaderIndex < data.Shaders.Count)
                 {
-                    // SURF_DETAIL is 0x8000000
                     if ((data.Shaders[side.ShaderIndex].SurfaceFlags & 0x8000000) != 0)
                     {
                         isDetail = true;
@@ -141,27 +147,124 @@ namespace JKDecompiler.Core
             {
                 int sideIndex = brush.FirstSide + i;
                 if (sideIndex >= data.BrushSides.Count) continue;
+                
                 var side = data.BrushSides[sideIndex];
                 var plane = data.Planes[side.PlaneIndex];
+
+                // Skip duplicate/near-identical planes within the same brush
+                bool duplicate = false;
+                foreach (var ep in exportedPlanes)
+                {
+                    if (Vector3.Dot(ep.Normal, plane.Normal) > 0.999f && Math.Abs(ep.Distance - plane.Distance) < 0.1f)
+                    {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate) continue;
+                exportedPlanes.Add(plane);
+
+                if (plane.Normal.LengthSquared() < 0.1f) continue;
                 
                 string shaderName = "common/caulk";
+                uint contentFlags = 0;
+                uint surfaceFlags = 0;
+
                 if (side.ShaderIndex >= 0 && side.ShaderIndex < data.Shaders.Count)
-                    shaderName = data.Shaders[side.ShaderIndex].Name;
+                {
+                    var shader = data.Shaders[side.ShaderIndex];
+                    if (!string.IsNullOrEmpty(shader.Name) && shader.Name != "noshader")
+                    {
+                        shaderName = CleanShaderName(shader.Name);
+                    }
+                    contentFlags = (uint)shader.ContentFlags;
+                    surfaceFlags = (uint)shader.SurfaceFlags;
+                }
 
-                // Attempt to find a face that matches this plane to solve for UVs
-                var alignment = SolveTextureAlignment(data, side, plane);
+                // Plane points determination
+                // Always use GeneratePlanePoints for Radiant stability (widely spaced, projected).
+                // Use faces ONLY for solving texture alignment.
+                Vector3 p1, p2, p3;
+                TextureAlignment alignment = TextureAlignment.Default;
+                (p1, p2, p3) = GeneratePlanePoints(plane);
 
-                var (p1, p2, p3) = GenerateThreePointsOnPlane(plane);
+                BspFace? matchedFace = null;
+                foreach (var face in data.Faces)
+                {
+                    if (face.ShaderIndex == side.ShaderIndex && face.NumVertices >= 3)
+                    {
+                        if (face.FirstVertexIndex < 0 || face.FirstVertexIndex >= data.Vertices.Count) continue;
+                        
+                        var v0 = data.Vertices[face.FirstVertexIndex].Position;
+                        float dist = Vector3.Dot(v0, plane.Normal) - plane.Distance;
+                        if (Math.Abs(dist) < 0.1f)
+                        {
+                            var vn = data.Vertices[face.FirstVertexIndex].Normal;
+                            if (Vector3.Dot(vn, plane.Normal) > 0.9f)
+                            {
+                                matchedFace = face;
+                                break;
+                            }
+                        }
+                    }
+                }
 
+                if (matchedFace != null)
+                {
+                    alignment = SolveTextureAlignmentFromFace(data, matchedFace, plane);
+                }
+
+                // Format: ( p1 ) ( p2 ) ( p3 ) shader shiftU shiftV rotate scaleU scaleV contentFlags surfaceFlags 0
                 writer.WriteLine(string.Format(CultureInfo.InvariantCulture, 
-                    "{0} {1} {2} {3} {4:0.######} {5:0.######} {6:0.######} {7:0.######} {8:0.######} 0 0 0",
+                    "{0} {1} {2} {3} {4:0.######} {5:0.######} {6:0.######} {7:0.######} {8:0.######} {9} {10} 0",
                     FormatVector(p1), FormatVector(p2), FormatVector(p3), shaderName,
-                    alignment.ShiftU, alignment.ShiftV, alignment.Rotation, alignment.ScaleU, alignment.ScaleV));
+                    alignment.ShiftU, alignment.ShiftV, alignment.Rotation, alignment.ScaleU, alignment.ScaleV,
+                    contentFlags, surfaceFlags));
             }
             
             if (isDetail) writer.WriteLine(" // detail");
-
             writer.WriteLine("}");
+        }
+
+        public void FinalizeExport()
+        {
+            Console.WriteLine("Map export finalized.");
+        }
+
+        private (Vector3, Vector3, Vector3) GeneratePlanePoints(BspPlane plane)
+        {
+            Vector3 n = plane.Normal;
+            if (n.LengthSquared() < 0.0001f) n = Vector3.UnitZ;
+            n = Vector3.Normalize(n);
+            
+            float d = plane.Distance;
+            Vector3 origin = n * d;
+
+            // Robust orthonormal basis generation
+            Vector3 u;
+            if (Math.Abs(n.X) < 0.5f) u = Vector3.UnitX;
+            else if (Math.Abs(n.Y) < 0.5f) u = Vector3.UnitY;
+            else u = Vector3.UnitZ;
+
+            Vector3 v = Vector3.Normalize(Vector3.Cross(u, n));
+            Vector3 w = Vector3.Cross(n, v);
+
+            // Very large scale for stability
+            float scale = 4096.0f;
+            Vector3 p1 = origin;
+            Vector3 p2 = origin + v * scale;
+            Vector3 p3 = origin + w * scale;
+
+            // Radiant expects the normal (p2-p1)x(p3-p1) to be INWARD.
+            // BSP normals are OUTWARD. So we want (p2-p1)x(p3-p1) . n < 0.
+            if (Vector3.Dot(Vector3.Cross(p2 - p1, p3 - p1), n) > 0)
+            {
+                var temp = p2;
+                p2 = p3;
+                p3 = temp;
+            }
+
+            return (p1, p2, p3);
         }
 
         private struct TextureAlignment
@@ -175,39 +278,16 @@ namespace JKDecompiler.Core
             public static TextureAlignment Default => new TextureAlignment { ScaleU = 0.5f, ScaleV = 0.5f };
         }
 
-        private TextureAlignment SolveTextureAlignment(BspData data, BspBrushSide side, BspPlane plane)
+        private TextureAlignment SolveTextureAlignmentFromFace(BspData data, BspFace face, BspPlane plane)
         {
-            // Find a face that uses this shader and is on this plane
-            // This is a heuristic: BSP faces are linked to shaders, but not directly to brush sides.
-            // However, we can search for a face that has matching normal and shader.
-            BspFace? bestMatch = null;
-            foreach (var face in data.Faces)
-            {
-                if (face.ShaderIndex == side.ShaderIndex)
-                {
-                    if (face.FirstVertexIndex < 0 || face.FirstVertexIndex >= data.Vertices.Count) continue;
-                    
-                    // Check if the face vertices are on this plane
-                    var v = data.Vertices[face.FirstVertexIndex];
-                    float dist = Vector3.Dot(v.Position, plane.Normal) - plane.Distance;
-                    if (Math.Abs(dist) < 0.1f)
-                    {
-                        bestMatch = face;
-                        break;
-                    }
-                }
-            }
-
-            if (bestMatch == null || bestMatch.NumVertices < 3)
+            GetBaseAxes(plane.Normal, out Vector3 axisU, out Vector3 axisV);
+            
+            // Need at least 2 vertices to solve for scale/shift
+            if (face.NumVertices < 2 || face.FirstVertexIndex < 0 || face.FirstVertexIndex + 1 >= data.Vertices.Count)
                 return TextureAlignment.Default;
 
-            GetBaseAxes(plane.Normal, out Vector3 axisU, out Vector3 axisV);
-
-            // Using two vertices to solve for Scale and Shift (assuming 0 rotation for now)
-            // U = (Pos . AxisU) / ScaleU + ShiftU
-            // U1 = D1/S + H => S = (D1-D2)/(U1-U2)
-            var v1 = data.Vertices[bestMatch.FirstVertexIndex];
-            var v2 = data.Vertices[bestMatch.FirstVertexIndex + 1];
+            var v1 = data.Vertices[face.FirstVertexIndex];
+            var v2 = data.Vertices[face.FirstVertexIndex + 1];
 
             float d1U = Vector3.Dot(v1.Position, axisU);
             float d2U = Vector3.Dot(v2.Position, axisU);
@@ -219,53 +299,53 @@ namespace JKDecompiler.Core
 
             var result = TextureAlignment.Default;
 
-            if (Math.Abs(deltaU) > 0.0001f)
+            if (Math.Abs(deltaU) > 0.000001f)
             {
                 result.ScaleU = (d1U - d2U) / deltaU;
                 result.ShiftU = v1.SurfaceUV.X - (d1U / result.ScaleU);
             }
 
-            if (Math.Abs(deltaV) > 0.0001f)
+            if (Math.Abs(deltaV) > 0.000001f)
             {
                 result.ScaleV = (d1V - d2V) / deltaV;
                 result.ShiftV = v1.SurfaceUV.Y - (d1V / result.ScaleV);
             }
             
+            result.ShiftU %= 512.0f;
+            result.ShiftV %= 512.0f;
+
             return result; 
         }
 
         private void GetBaseAxes(Vector3 normal, out Vector3 axisU, out Vector3 axisV)
         {
-            // Standard Quake 3 / Radiant base axes logic
-            // Find the axis with the smallest absolute normal component
-            int axis = 0;
-            float best = 1.0f;
+            int bestAxis = 0;
+            float bestValue = -1.0f;
 
             for (int i = 0; i < 3; i++)
             {
                 float val = Math.Abs(i switch { 0 => normal.X, 1 => normal.Y, 2 => normal.Z, _ => 0 });
-                if (val < best)
+                if (val > bestValue)
                 {
-                    best = val;
-                    axis = i;
+                    bestValue = val;
+                    bestAxis = i;
                 }
             }
 
-            // This is a simplification of the full Radiant table-based logic
-            if (Math.Abs(normal.Z) > 0.70710678f) // Mostly Vertical
-            {
-                axisU = new Vector3(1, 0, 0);
-                axisV = new Vector3(0, -1, 0);
-            }
-            else if (Math.Abs(normal.X) > 0.70710678f) // Mostly East/West
+            if (bestAxis == 0) // X major
             {
                 axisU = new Vector3(0, 1, 0);
                 axisV = new Vector3(0, 0, -1);
             }
-            else // Mostly North/South
+            else if (bestAxis == 1) // Y major
             {
                 axisU = new Vector3(1, 0, 0);
                 axisV = new Vector3(0, 0, -1);
+            }
+            else // Z major
+            {
+                axisU = new Vector3(1, 0, 0);
+                axisV = new Vector3(0, -1, 0);
             }
         }
 
@@ -274,23 +354,14 @@ namespace JKDecompiler.Core
             return string.Format(CultureInfo.InvariantCulture, "( {0:0.######} {1:0.######} {2:0.######} )", v.X, v.Y, v.Z);
         }
 
-        private (Vector3, Vector3, Vector3) GenerateThreePointsOnPlane(BspPlane plane)
+        private string CleanShaderName(string name)
         {
-            Vector3 n = plane.Normal;
-            float d = plane.Distance;
-
-            // Find a vector not parallel to n
-            Vector3 v = Math.Abs(n.X) < 0.7f ? Vector3.UnitX : Vector3.UnitY;
-
-            Vector3 u = Vector3.Normalize(Vector3.Cross(v, n));
-            Vector3 w = Vector3.Cross(n, u);
-
-            Vector3 origin = n * d;
-            Vector3 p1 = origin;
-            Vector3 p2 = origin + u * 64;
-            Vector3 p3 = origin + w * 64;
-
-            return (p1, p2, p3);
+            if (string.IsNullOrEmpty(name)) return "common/caulk";
+            if (name.StartsWith("textures/", StringComparison.OrdinalIgnoreCase))
+            {
+                return name.Substring(9);
+            }
+            return name;
         }
     }
 }

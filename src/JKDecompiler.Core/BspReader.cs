@@ -35,18 +35,24 @@ namespace JKDecompiler.Core
                     throw new InvalidDataException($"Invalid BSP version: {version}. Expected {RBSP_VERSION}");
                 }
 
-                var lumps = new Lump[18];
+                // RBSP can have 18 or 19 lumps. Let's read 18 first, then check if we can read one more.
+                var lumps = new List<Lump>();
                 for (int i = 0; i < 18; i++)
                 {
-                    lumps[i] = new Lump
+                    lumps.Add(new Lump
                     {
                         Offset = reader.ReadInt32(),
                         Length = reader.ReadInt32()
-                    };
+                    });
                 }
 
+                // Try to read 19th lump if it looks valid (doesn't point to crazy offsets)
+                // However, most JKA maps are 18 lumps.
+                // Let's stick to 18 for now to be safe, unless we have a reason to expect 19.
+                // Looking at t1_sour, Lump 18 offset was garbage.
+
                 var data = new BspData();
-                for (int i = 0; i < 18; i++) Console.WriteLine($"Lump {i}: Offset {lumps[i].Offset}, Length {lumps[i].Length}");
+                for (int i = 0; i < lumps.Count; i++) Console.WriteLine($"Lump {i}: Offset {lumps[i].Offset}, Length {lumps[i].Length}");
                 data.RawEntities = ReadEntities(reader, lumps[0]);
                 data.Entities = BspEntityParser.Parse(data.RawEntities);
                 data.Shaders = ReadShaders(reader, lumps[1]);
@@ -66,7 +72,7 @@ namespace JKDecompiler.Core
                 data.Fogs = ReadFogs(reader, lumps[12]);
                 data.Visibility = ReadVisibility(reader, lumps[16]);
                 data.LightArray = ReadLightArray(reader, lumps[17]);
-                // data.Decals = ReadDecals(reader, lumps[18]); // Lump 18 might not exist
+                
                 return data;
             }
         }
@@ -302,7 +308,7 @@ namespace JKDecompiler.Core
         private List<BspBrushSide> ReadBrushSides(BinaryReader reader, Lump lump)
         {
             reader.BaseStream.Position = lump.Offset;
-            int count = lump.Length / 8;
+            int count = lump.Length / 12; // JKA uses 12 bytes for brush sides
             var sides = new List<BspBrushSide>(count);
             for (int i = 0; i < count; i++)
             {
@@ -311,6 +317,7 @@ namespace JKDecompiler.Core
                     PlaneIndex = reader.ReadInt32(),
                     ShaderIndex = reader.ReadInt32()
                 });
+                reader.ReadInt32(); // Skip the 3rd field (Brush index?)
             }
             return sides;
         }
