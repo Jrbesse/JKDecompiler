@@ -13,16 +13,19 @@ public class FixtureTests
 {
     private static readonly string? Dir = Environment.GetEnvironmentVariable("JKA_BSP_FIXTURES");
 
+    private static bool Enabled => !string.IsNullOrWhiteSpace(Dir);
+
     private static string[] FixtureFiles() =>
-        Dir == null ? Array.Empty<string>()
-        : Directory.GetFiles(Dir, "*.bsp", SearchOption.AllDirectories);
+        Enabled ? Directory.GetFiles(Dir!, "*.bsp", SearchOption.AllDirectories)
+                : Array.Empty<string>();
 
     [Fact]
     public void EveryFixtureReadsAndValidatesClean()
     {
-        if (Dir == null)
+        if (!Enabled)
         {
-            // explicit skip message for local runs
+            // explicit skip message for local runs; GitHub vars resolve to
+            // "" (not null) when unset, so treat empty the same as missing
             Assert.True(true, "JKA_BSP_FIXTURES not set — fixture tests skipped");
             return;
         }
@@ -52,7 +55,7 @@ public class FixtureTests
     [Fact]
     public void FixtureLightmapsAreExtractable()
     {
-        if (Dir == null) return;
+        if (!Enabled) return;
         var files = FixtureFiles();
         Assert.True(files.Length > 0, $"no .bsp files under {Dir}");
 
