@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Numerics;
+using System.Text.Json;
 using JKDecompiler.Core;
 
 return RunCli.Run(args);
@@ -22,6 +23,7 @@ static class RunCli
                 case "gen-synthetic": return GenSynthetic(args);
                 case "convert": return Convert(args);
                 case "convert-dir": return ConvertDir(args);
+                case "recover-lights": return RecoverLights(args);
                 default: PrintUsage(); return 2;
             }
         }
@@ -153,6 +155,105 @@ static class RunCli
         return ok == rs.Count ? 0 : 1;
     }
 
+    private static int OptI(string[] args, string name, int dflt)
+    {
+        int i = Array.IndexOf(args, name);
+        return i >= 0 && i + 1 < args.Length && int.TryParse(args[i + 1], out int v) ? v : dflt;
+    }
+
+    private static float OptF(string[] args, string name, float dflt)
+    {
+        int i = Array.IndexOf(args, name);
+        return i >= 0 && i + 1 < args.Length && float.TryParse(args[i + 1], out float v) ? v : dflt;
+    }
+
+    /// <summary>
+    /// M2.5 stage 1: grid seeding — recover light candidates from the baked
+    /// lightgrid (directions + directed colors), emit target_light/light
+    /// pairs as a .map fragment + a sidecar + a top-down overlay.
+    /// </summary>
+    private static int RecoverLights(string[] args)
+    {
+        var pos = args.Where(a => !a.StartsWith("--")).Skip(1).ToArray();
+        if (pos.Length < 2)
+        {
+            Console.Error.WriteLine("usage: jkdecompiler recover-lights <bsp> <outdir> [--min-cells N] [--max-ray-dist F] [--directed-min F]");
+            Console.Error.WriteLine("  M2.5 stage 1: grid seeding — recover light entities from the baked lightgrid");
+            return 2;
+        }
+        var d = new BspReader().Read(pos[0]);
+        var lr = new LightRecovery
+        {
+            MinCells = OptI(args, "--min-cells", 6),
+            MaxRayDist = OptF(args, "--max-ray-dist", 32f),
+            DirectedMin = OptF(args, "--directed-min", 5f),
+        };
+        var r = lr.Recover(d);
+
+        Directory.CreateDirectory(pos[1]);
+        LightRecovery.WriteMapFragment(r, Path.GetFileName(pos[0]), Path.Combine(pos[1], "recovered_lights.map"));
+        LightRecovery.WriteOverlay(r, d, Path.Combine(pos[1], "recovered_lights_overlay.png"));
+        var sidecar = new Dictionary<string, object?>
+        {
+            ["map"] = Path.GetFileName(pos[0]),
+            ["stage"] = "M2.5 stage 1 (grid seeding); stage 2 refits intensity/color against the baked blocks",
+            ["grid"] = new
+            {
+                valid = r.GridValid,
+                note = r.GridNote,
+                dims = r.GridDims,
+                origin = new[] { r.GridOrigin.X, r.GridOrigin.Y, r.GridOrigin.Z },
+                corners = r.Corners,
+                paletteCells = r.PaletteCells
+            },
+            ["samples"] = new { used = r.SamplesUsed, skippedFaint = r.SamplesSkippedFaint },
+            ["accepted"] = r.Lights.Select(l => new
+            {
+                name = l.Name,
+                position = new[] { l.Position.X, l.Position.Y, l.Position.Z },
+                level = l.Level,
+                levelLowerBound = l.LevelLowerBound,
+                radius = l.Radius,
+                color = new[] { (int)l.Color.X, (int)l.Color.Y, (int)l.Color.Z },
+                style = l.Style,
+                cells = l.CellCount,
+                rayDistMedian = l.RayDistMedian,
+                tPositiveFrac = l.TPositiveFrac,
+                levelConsistency = l.LevelConsistency,
+                angleMedianDeg = l.AngleMedianDeg,
+                angleP90Deg = l.AngleP90Deg
+            }).ToList(),
+            ["rejected"] = r.Rejected.Select(rc => new
+            {
+                cells = rc.CellCount,
+                reason = rc.Reason,
+                position = new[] { rc.Position.X, rc.Position.Y, rc.Position.Z },
+                rayDistMedian = rc.RayDistMedian,
+                tPositiveFrac = rc.TPositiveFrac
+            }).ToList()
+        };
+        File.WriteAllText(Path.Combine(pos[1], "recovered_lights.json"),
+            JsonSerializer.Serialize(sidecar, new JsonSerializerOptions { WriteIndented = true }));
+
+        Console.WriteLine($"=> {Path.GetFileName(pos[0])}");
+        if (!r.GridValid)
+        {
+            Console.WriteLine($"grid INVALID: {r.GridNote}");
+            Console.WriteLine($"wrote (empty) fragment + sidecar to {Path.GetFullPath(pos[1])}");
+            return 1;
+        }
+        Console.WriteLine($"grid {r.GridDims[0]}x{r.GridDims[1]}x{r.GridDims[2]} (corners {r.Corners}, palette {r.PaletteCells}) — samples {r.SamplesUsed}, faint skipped {r.SamplesSkippedFaint}");
+        foreach (var l in r.Lights)
+            Console.WriteLine($"  {l.Name}: pos=({l.Position.X:0.#} {l.Position.Y:0.#} {l.Position.Z:0.#}) " +
+                $"level={l.Level?.ToString() ?? "saturated"} color=({(int)l.Color.X} {(int)l.Color.Y} {(int)l.Color.Z}) " +
+                $"style={l.Style} cells={l.CellCount} rayMed={l.RayDistMedian:0.#} t+={l.TPositiveFrac:P0}");
+        foreach (var rc in r.Rejected)
+            Console.WriteLine($"  rejected: {rc.CellCount} cells — {rc.Reason}");
+        Console.WriteLine($"accepted {r.Lights.Count}/{r.Lights.Count + r.Rejected.Count} clusters");
+        Console.WriteLine($"wrote recovered_lights.map + recovered_lights_overlay.png + recovered_lights.json to {Path.GetFullPath(pos[1])}");
+        return 0;
+    }
+
     private static string ConvertLine(ConvertResult r)
     {
         string name = Path.GetFileName(r.SourceBsp);
@@ -176,6 +277,7 @@ static class RunCli
               jkdecompiler gen-synthetic <out.bsp>   write a small valid RBSP (CI/fixture use)
               jkdecompiler convert <bsp> <q3map2> <out>     M2: q3map2 -convert -> .map + report
               jkdecompiler convert-dir <dir> <q3map2> <out> M2: batch over a .bsp directory
+              jkdecompiler recover-lights <bsp> <out>       M2.5s1: recover lights from the lightgrid
             """);
     }
 }
