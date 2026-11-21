@@ -20,6 +20,8 @@ static class RunCli
                 case "verify": return Verify(args);
                 case "extract": return Extract(args);
                 case "gen-synthetic": return GenSynthetic(args);
+                case "convert": return Convert(args);
+                case "convert-dir": return ConvertDir(args);
                 default: PrintUsage(); return 2;
             }
         }
@@ -93,6 +95,75 @@ static class RunCli
         return 0;
     }
 
+    private static (string[] pos, bool recompile) SplitArgs(string[] args)
+    {
+        var pos = args.Where(a => !a.StartsWith("--")).ToArray();
+        return (pos, args.Any(a => a == "--recompile"));
+    }
+
+    private static string? RecompileLine(ConvertResult r)
+    {
+        if (r.Recompile == null) return null;
+        bool clean = (bool)r.Recompile["clean"];
+        string detail = clean
+            ? "CLEAN"
+            : $"FAILED (rc={r.Recompile["exitCode"]}, {((List<string>)r.Recompile["errors"]!).Count} errors)";
+        return $"  recompile: {detail}";
+    }
+
+    private static int Convert(string[] args)
+    {
+        var (pos, recompile) = SplitArgs(args);
+        if (pos.Length < 4)
+        {
+            Console.Error.WriteLine("usage: jkdecompiler convert <bsp> <q3map2-binary> <outdir> [--recompile]");
+            Console.Error.WriteLine("  runs: <q3map2> -game ja -convert -format map <bsp> (M2 pipeline)");
+            Console.Error.WriteLine("  --recompile: also compile the generated .map back to a BSP (validity proof)");
+            return 2;
+        }
+        var r = new ConvertOrchestrator().Convert(pos[1], pos[2], pos[3], recompile: recompile);
+        Console.WriteLine(ConvertLine(r));
+        var rc = RecompileLine(r);
+        if (rc != null) Console.WriteLine(rc);
+        return r.Ok && (r.Recompile == null || (bool)r.Recompile["clean"]) ? 0 : 1;
+    }
+
+    private static int ConvertDir(string[] args)
+    {
+        var (pos, recompile) = SplitArgs(args);
+        if (pos.Length < 4)
+        {
+            Console.Error.WriteLine("usage: jkdecompiler convert-dir <bsp-dir> <q3map2-binary> <outdir> [--recompile]");
+            return 2;
+        }
+        var rs = new ConvertOrchestrator().ConvertDirectory(pos[1], pos[2], pos[3], recompile: recompile);
+        foreach (var r in rs)
+        {
+            Console.WriteLine(ConvertLine(r));
+            var rc = RecompileLine(r);
+            if (rc != null) Console.WriteLine(rc);
+        }
+        int ok = rs.Count(r => r.Ok);
+        int rcClean = rs.Count(r => r.Recompile != null && (bool)r.Recompile["clean"]);
+        int ent = rs.Count(r => r.Original != null && r.Map != null
+            && (int)r.Original["entities"]! == (int)r.Map["entities"]!);
+        Console.WriteLine($"RESULT: {ok}/{rs.Count} converted, {ent}/{rs.Count} with entity count preserved" +
+            (recompile ? $", {rcClean}/{rs.Count} recompile-clean" : ""));
+        Console.WriteLine($"summary: {Path.GetFullPath(Path.Combine(pos[3], "convert_summary.json"))}");
+        return ok == rs.Count ? 0 : 1;
+    }
+
+    private static string ConvertLine(ConvertResult r)
+    {
+        string name = Path.GetFileName(r.SourceBsp);
+        string orig = r.Original != null && r.Original.ContainsKey("entities")
+            ? $"in  {r.Original["entities"]}e/{r.Original["patches"]}p/{r.Original["brushes"]}b" : "in  -";
+        string map = r.Map != null
+            ? $"out {r.Map["entities"]}e/{r.Map["patches"]}p/{r.Map["brushes"]}b" : "out -";
+        string status = r.Ok ? "OK " : $"ERR(rc={r.Q3map2ExitCode})";
+        return $"{status} {name}: {orig} {map} {r.Warnings.Count} warning(s) {r.ElapsedMs}ms";
+    }
+
     private static void PrintUsage()
     {
         Console.WriteLine("""
@@ -103,6 +174,8 @@ static class RunCli
               jkdecompiler verify <bsp> [bsp ...]    run structural invariants (exit 1 on errors)
               jkdecompiler extract <bsp> <outdir>    extract lightmaps, face footprints, grid/array, sidecar
               jkdecompiler gen-synthetic <out.bsp>   write a small valid RBSP (CI/fixture use)
+              jkdecompiler convert <bsp> <q3map2> <out>     M2: q3map2 -convert -> .map + report
+              jkdecompiler convert-dir <dir> <q3map2> <out> M2: batch over a .bsp directory
             """);
     }
 }

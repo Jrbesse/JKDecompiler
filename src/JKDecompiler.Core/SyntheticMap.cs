@@ -24,7 +24,7 @@ namespace JKDecompiler.Core
         d.Shaders.Add(new BspShader { Name = "textures/common/brick", SurfaceFlags = 0, ContentFlags = 1 });
 
         // 6 box planes
-        float S = 0f, E = 128f;
+        float E = 128f;
         (Vector3 n, float dist)[] planes =
         {
             (new Vector3(1, 0, 0), 0f), (new Vector3(-1, 0, 0), E),
