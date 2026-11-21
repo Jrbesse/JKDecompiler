@@ -99,7 +99,7 @@ namespace JKDecompiler.Core
                     
                     writer.Write(string.Format(CultureInfo.InvariantCulture, 
                         "( {0:0.######} {1:0.######} {2:0.######} {3:0.######} {4:0.######} ) ",
-                        v.Position.X, v.Position.Y, v.Position.Z, v.SurfaceUV.X, v.SurfaceUV.Y));
+                        v.Position.X, v.Position.Y, v.Position.Z, v.St.X, v.St.Y));
                 }
                 writer.WriteLine(")");
             }
@@ -294,21 +294,21 @@ namespace JKDecompiler.Core
             float d1V = Vector3.Dot(v1.Position, axisV);
             float d2V = Vector3.Dot(v2.Position, axisV);
 
-            float deltaU = v1.SurfaceUV.X - v2.SurfaceUV.X;
-            float deltaV = v1.SurfaceUV.Y - v2.SurfaceUV.Y;
+            float deltaU = v1.St.X - v2.St.X;
+            float deltaV = v1.St.Y - v2.St.Y;
 
             var result = TextureAlignment.Default;
 
             if (Math.Abs(deltaU) > 0.000001f)
             {
                 result.ScaleU = (d1U - d2U) / deltaU;
-                result.ShiftU = v1.SurfaceUV.X - (d1U / result.ScaleU);
+                result.ShiftU = v1.St.X - (d1U / result.ScaleU);
             }
 
             if (Math.Abs(deltaV) > 0.000001f)
             {
                 result.ScaleV = (d1V - d2V) / deltaV;
-                result.ShiftV = v1.SurfaceUV.Y - (d1V / result.ScaleV);
+                result.ShiftV = v1.St.Y - (d1V / result.ScaleV);
             }
             
             result.ShiftU %= 512.0f;
