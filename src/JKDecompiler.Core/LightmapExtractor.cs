@@ -268,7 +268,8 @@ namespace JKDecompiler.Core
             return new byte[] { (byte)(r * 255), (byte)(g * 255), (byte)(b * 255) };
         }
 
-        private static int GridDim(BspModel m0, int axis)
+        /// <summary>Grid dim along one axis (shared with LightRecovery).</summary>
+        internal static int GridDim(BspModel m0, int axis)
         {
             // mirrors R_LoadLightGrid in OpenJK tr_bsp.cpp (steps 64/64/128)
             float[] size = { 64f, 64f, 128f };
