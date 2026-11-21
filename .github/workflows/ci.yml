@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Build
+        run: dotnet build JKDecompiler.sln -c Release
+      - name: Test
+        run: dotnet test tests/JKDecompiler.Tests -c Release --no-build
+        # JKA_BSP_FIXTURES (repo variable) gates the real-map fixture tests.
+        # Copyrighted BSP fixtures are intentionally NOT in the repo; when the
+        # variable is unset those tests skip and CI runs on synthetic data.
+        env:
+          JKA_BSP_FIXTURES: ${{ vars.JKA_BSP_FIXTURES }}
+      - name: Smoke (synthetic round trip)
+        run: |
+          dotnet src/JKDecompiler.Cli/bin/Release/net8.0/jkdecompiler.dll gen-synthetic /tmp/synthetic.bsp
+          dotnet src/JKDecompiler.Cli/bin/Release/net8.0/jkdecompiler.dll verify /tmp/synthetic.bsp
+          dotnet src/JKDecompiler.Cli/bin/Release/net8.0/jkdecompiler.dll extract /tmp/synthetic.bsp /tmp/synthetic_extract
+          ls /tmp/synthetic_extract

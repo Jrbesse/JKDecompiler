@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
-using System.Text.RegularExpressions;
 
 namespace JKDecompiler.Core
 {
@@ -41,7 +40,6 @@ namespace JKDecompiler.Core
                     scripts.Add(script);
                 }
             }
-            // Check PARM1-8 as well
             for (int i = 1; i <= 8; i++)
             {
                 if (KeyValues.TryGetValue($"PARM{i}", out var parm) && parm.EndsWith(".ibi", StringComparison.OrdinalIgnoreCase))
@@ -53,21 +51,79 @@ namespace JKDecompiler.Core
         }
     }
 
+    /// <summary>
+    /// Quote-aware tokenizer for the entity lump. Replaces the old
+    /// regex \{[^}]*\} which broke on any value containing '}' (script
+    /// strings, quotes in comments, etc.).
+    /// </summary>
     public static class BspEntityParser
     {
         public static List<BspEntity> Parse(string entityString)
         {
             var entities = new List<BspEntity>();
-            var matches = Regex.Matches(entityString, @"\{[^\}]*\}");
+            int i = 0;
+            int n = entityString.Length;
 
-            foreach (Match match in matches)
+            while (i < n)
             {
+                char c = entityString[i];
+                if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\0') { i++; continue; }
+                if (c == '}') { i++; continue; } // stray close outside an entity
+
+                if (c != '{')
+                    throw new FormatException($"entity lump: unexpected char '{c}' at offset {i}");
+
+                i++; // consume '{'
                 var entity = new BspEntity();
-                var kvMatches = Regex.Matches(match.Value, @"""([^""]+)""\s+""([^""]*)""");
-                foreach (Match kvMatch in kvMatches)
+                var keys = new List<string>();
+                int pendingKey = -1; // index into keys awaiting a value; -1 = none
+
+                while (i < n)
                 {
-                    entity.KeyValues[kvMatch.Groups[1].Value] = kvMatch.Groups[2].Value;
+                    c = entityString[i];
+                    if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\0') { i++; continue; }
+
+                    if (c == '}') { i++; break; }
+                    if (c == '{')
+                        throw new FormatException($"entity lump: nested '{{' at offset {i}");
+
+                    if (c != '"')
+                        throw new FormatException($"entity lump: expected '\"' at offset {i}, got '{c}'");
+
+                    // read a quoted string, honoring \" and \\ escapes
+                    i++;
+                    var sb = new System.Text.StringBuilder();
+                    while (i < n)
+                    {
+                        c = entityString[i];
+                        if (c == '\\' && i + 1 < n)
+                        {
+                            sb.Append(entityString[i + 1]);
+                            i += 2;
+                            continue;
+                        }
+                        if (c == '"') { i++; break; }
+                        sb.Append(c);
+                        i++;
+                    }
+                    if (i >= n)
+                        throw new FormatException($"entity lump: unterminated string at offset {i}");
+
+                    string token = sb.ToString();
+                    if (pendingKey < 0)
+                    {
+                        keys.Add(token);
+                        pendingKey = keys.Count - 1;
+                    }
+                    else
+                    {
+                        entity.KeyValues[keys[pendingKey]] = token;
+                        pendingKey = -1;
+                    }
                 }
+
+                if (pendingKey >= 0)
+                    throw new FormatException($"entity lump: key '{keys[pendingKey]}' missing value");
                 entities.Add(entity);
             }
 
