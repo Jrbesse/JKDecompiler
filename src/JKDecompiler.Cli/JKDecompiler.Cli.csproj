@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>jkdecompiler</AssemblyName>
+    <RootNamespace>JKDecompiler.Cli</RootNamespace>
+    <RollForward>Major</RollForward>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\JKDecompiler.Core\JKDecompiler.Core.csproj" />
+  </ItemGroup>
+
+</Project>
