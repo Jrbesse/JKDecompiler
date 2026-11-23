@@ -578,12 +578,11 @@ namespace JKDecompiler.Core
         /// <summary>
         /// Probe-driven sample points: points live on PROBE faces, with the
         /// probe's (face, block, UV) stored per point. q3map2 jitters lightmap
-        /// UVs by up to ~1 px between independently compiled BSPs, so sampling
-        /// each candidate with its own UVs injects large value jumps at face
-        /// boundaries; instead every candidate is read at the probe's UVs (see
-        /// SampleCandidate), which makes single fields jitter-free because
-        /// probe and single compiles share the same light count and therefore
-        /// the same -bsp geometry and lightmap layout.
+        /// UVs by up to ~1 px between independently compiled BSPs, so the
+        /// stored probe UVs are only used to read the probe itself; candidates
+        /// are sampled through their own world→UV affine (SampleCandidate) —
+        /// their lightmap packing differs from the probe's even at equal light
+        /// counts, so the probe's UVs cannot be reused.
         /// Points whose original face can't be located are skipped (no target).
         /// </summary>
         internal (List<SamplePair> Pairs, int Unmatched, int Matched)
@@ -1632,14 +1631,21 @@ namespace JKDecompiler.Core
         /// because a point with no lightmap in the single compile means the
         /// light contributed nothing there (the raw 0 minus the probe's 65
         /// ambient would otherwise inject a fake negative lobe).
+        ///
+        /// Each point is read through the CANDIDATE's own world→UV affine.
+        /// (An earlier version reused the probe's stored UV whenever the
+        /// candidate face's block index happened to equal the probe's — the
+        /// assumption was "same light count ⇒ same lightmap layout". It is
+        /// false: the probe's dummy and a single light touch different face
+        /// sets, so the packings differ, and a coincidental block-index match
+        /// read the wrong page. Measured symptom: 7 different single lights
+        /// with byte-identical fields and ~40% of points negative.)
         /// </summary>
         internal List<(double R, double G, double B)> SampleCandidate(BspData cand, List<SampleFace> candFaces, List<SamplePair> pairs, bool[]? valid = null)
         {
             // Locate the candidate face spatially (face-array indices shift
             // when UV packing splits faces, so index matching is unsafe), then
-            // read at the probe's stored UV when the block matches — same page,
-            // same UV, zero jitter. Fall back to the candidate's own UVs when
-            // the layout differs (e.g. the final multi-light compile).
+            // read at the candidate's own UV for that world point.
             var spatial = new CandidateIndex(candFaces);
             var vals = new List<(double, double, double)>(pairs.Count);
             for (int i = 0; i < pairs.Count; i++)
@@ -1653,9 +1659,7 @@ namespace JKDecompiler.Core
                     continue;
                 }
                 if (valid != null) valid[i] = true;
-                (double u, double v) = (f.Block == p.PBlock)
-                    ? (p.PU, p.PV)
-                    : WorldToUv(f, new SamplePoint { X = p.X, Y = p.Y, Z = p.Z });
+                var (u, v) = WorldToUv(f, new SamplePoint { X = p.X, Y = p.Y, Z = p.Z });
                 var c = SampleBlock(cand.Lightmaps[f.Block].Data, u, v);
                 vals.Add((c.R, c.G, c.B));
             }
