@@ -21,6 +21,9 @@
 *.sqlite
 *.db
 
+# Local tooling (q3map2 binaries + shared libs; never commit — see M2.5 stage 2)
+/tools/
+
 # OS specific
 .DS_Store
 Thumbs.db
