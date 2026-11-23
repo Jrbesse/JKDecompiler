@@ -139,6 +139,11 @@ namespace JKDecompiler.Core
             public (double X, double Y, double Z) Center = default;
             public (double X, double Y, double Z) Normal = (0, 0, 1);
             public double PlaneDist;
+            // UV bounding box of the face's vertex UVs (block fractions).
+            // Sampling must stay inside it: the 128x128 block is shared by
+            // many faces, and bilinear bleeding across the box reads texels
+            // of NEIGHBORING faces (their values are unrelated).
+            public double UMin = 0, UMax = 0, VMin = 0, VMax = 0;
         }
 
         internal class SamplePoint
@@ -147,10 +152,37 @@ namespace JKDecompiler.Core
         }
 
         /// <summary>
+        /// Point-in-solid test against the world model's brush hulls: inside if
+        /// within the convex hull of ANY world brush (all brush-side planes
+        /// satisfied). Used to push light seeds out of slabs before compiling —
+        /// a light inside a solid is culled or nudged by q3map2, which
+        /// displaces its baked pool (measured: nudged pools correlate ~0.04
+        /// with the target vs ~0.2+ for free-space lights).
+        /// </summary>
+        public static bool PointInWorldSolid(BspData d, Vector3 p)
+        {
+            if (d.Models.Count == 0) return false;
+            var w = d.Models[0];
+            for (int b = w.FirstBrush; b < w.FirstBrush + w.NumBrushes; b++)
+            {
+                var br = d.Brushes[b];
+                bool inAll = true;
+                for (int i = 0; i < br.NumSides; i++)
+                {
+                    var pl = d.Planes[d.BrushSides[br.FirstSide + i].PlaneIndex];
+                    double dist = pl.Normal.X * p.X + pl.Normal.Y * p.Y + pl.Normal.Z * p.Z - pl.Distance;
+                    if (dist > 0.01f) { inAll = false; break; }
+                }
+                if (inAll) return true;
+            }
+            return false;
+        }
+
+        /// <summary>
         /// Build lit-face sample data from a BSP: per-face world verts, UVs,
         /// world→UV affine (planar faces), 2D hull + local frame, interior grid.
         /// </summary>
-        internal static List<SampleFace> BuildSampleFaces(BspData d)
+        static List<SampleFace> BuildSampleFaces(BspData d)
         {
             var list = new List<SampleFace>();
             for (int i = 0; i < d.Faces.Count; i++)
@@ -169,6 +201,15 @@ namespace JKDecompiler.Core
                     var vert = d.Vertices[f.FirstVertexIndex + v];
                     sf.Verts[v] = (vert.Position.X, vert.Position.Y, vert.Position.Z);
                     sf.VertexUvs[v] = (vert.GetLightmapU(0), vert.GetLightmapV(0));
+                }
+                {
+                    double umn = double.MaxValue, umx = double.MinValue, vmn = double.MaxValue, vmx = double.MinValue;
+                    for (int v = 0; v < n; v++)
+                    {
+                        umn = Math.Min(umn, sf.VertexUvs[v].U); umx = Math.Max(umx, sf.VertexUvs[v].U);
+                        vmn = Math.Min(vmn, sf.VertexUvs[v].V); vmx = Math.Max(vmx, sf.VertexUvs[v].V);
+                    }
+                    sf.UMin = umn; sf.UMax = umx; sf.VMin = vmn; sf.VMax = vmx;
                 }
                 double cx = 0, cy = 0, cz = 0;
                 for (int v = 0; v < n; v++) { cx += sf.Verts[v].X; cy += sf.Verts[v].Y; cz += sf.Verts[v].Z; }
@@ -501,6 +542,27 @@ namespace JKDecompiler.Core
                     (byte)Math.Clamp(Math.Round(m.B), 0, 255));
         }
 
+        internal static (byte R, byte G, byte B) SampleFaceValue(byte[] block, SampleFace sf, double u, double v)
+        {
+            // Sub-texel (degenerate) faces — the compiler's "solid" faces get
+            // one UV for the whole face — read the single nearest texel.
+            // Bilinear there would blend in texels of NEIGHBORING faces that
+            // share the same 128x128 block (unrelated values; measured up to
+            // ±48 byte errors, e.g. a 65-ambient face read as 17).
+            if ((sf.UMax - sf.UMin) * 127 < 1.0 || (sf.VMax - sf.VMin) * 127 < 1.0)
+            {
+                int x = Math.Clamp((int)Math.Round(u * 127), 0, 127);
+                int y = Math.Clamp((int)Math.Round(v * 127), 0, 127);
+                int p = (y * 128 + x) * 3;
+                return (block[p], block[p + 1], block[p + 2]);
+            }
+            // Multi-texel face: clamp into the face's own UV box so the
+            // bilinear window never crosses into a neighbor face's texels.
+            u = Math.Clamp(u, sf.UMin, sf.UMax);
+            v = Math.Clamp(v, sf.VMin, sf.VMax);
+            return SampleBlock(block, u, v);
+        }
+
         // ------------------------------------------------------------------
         // Candidate face location (spatial hash over candidate lit faces)
         // ------------------------------------------------------------------
@@ -556,6 +618,16 @@ namespace JKDecompiler.Core
                         double px = ddx * u.X + ddy * u.Y + ddz * u.Z;
                         double py = ddx * v.X + ddy * v.Y + ddz * v.Z;
                         if (!PointInHull(f.Hull2D, px, py, 1.0)) continue;
+                        // UV-box containment: coplanar neighbors share the
+                        // plane test, and on a shared edge the hull test
+                        // passes for BOTH. Without this, center-distance
+                        // tie-breaks pick a different face per compile and
+                        // the read lands on the neighbor's texels (measured:
+                        // a point at a sliver corner sampled 1-2 texels
+                        // outside the true face's UV box).
+                        var (fu, fv) = WorldToUv(f, new SamplePoint { X = x, Y = y, Z = z });
+                        double m = 0.75 / 127.0;
+                        if (fu < f.UMin - m || fu > f.UMax + m || fv < f.VMin - m || fv > f.VMax + m) continue;
                         double cdx = f.Center.X - x, cdy = f.Center.Y - y, cdz = f.Center.Z - z;
                         double d = cdx * cdx + cdy * cdy + cdz * cdz;
                         if (d < bestD) { bestD = d; best = f; }
@@ -613,7 +685,7 @@ namespace JKDecompiler.Core
                 }
                 foreach (var (p, ww, pu, pv) in byTexel.Values)
                 {
-                    var pval = SampleBlock(probe.Lightmaps[pf.Block].Data, pu, pv);
+                    var pval = SampleFaceValue(probe.Lightmaps[pf.Block].Data, pf, pu, pv);
                     var of = idx.Find(p.X, p.Y, p.Z);
                     if (of == null)
                     {
@@ -622,7 +694,7 @@ namespace JKDecompiler.Core
                     }
                     matched++;
                     var (ou, ov) = WorldToUv(of, p);
-                    var oval = SampleBlock(orig.Lightmaps[of.Block].Data, ou, ov);
+                    var oval = SampleFaceValue(orig.Lightmaps[of.Block].Data, of, ou, ov);
                     pairs.Add(new SamplePair(p.X, p.Y, p.Z, ww, oval.R, oval.G, oval.B, pval.R, pval.G, pval.B,
                         of.Normal.X, of.Normal.Y, of.Normal.Z, pf.FaceIndex, pf.Block, pu, pv,
                         of.FaceIndex, of.Block, ou, ov));
@@ -864,6 +936,132 @@ namespace JKDecompiler.Core
         }
 
         /// <summary>
+        /// Lawson–Hanson non-negative least squares: min ||Gs − h||² subject to
+        /// s ≥ 0. Exact active-set algorithm — converges in finite steps for a
+        /// positive-definite G. Used on the greedy-selected light set, where the
+        /// normal equations are ill-conditioned (overlapping monochrome pools) and
+        /// clamped coordinate descent oscillates. Ridge (relative to mean diagonal)
+        /// is added by the caller for conditioning; it makes the solution the
+        /// exact optimum of the slightly regularized problem, which for relative
+        /// ridge 1e-3 differs from the unregularized optimum by ~0.1% in scale.
+        /// </summary>
+        public static double[] NnlsSolve(double[,] G, double[] h, double ridge = 0.0)
+        {
+            int n = h.Length;
+            // add ridge to the diagonal (copy — the caller's matrix may be reused)
+            for (int i = 0; i < n; i++) G[i, i] += ridge;
+
+            var s = new double[n];
+            var inSet = new bool[n];
+
+            for (int iter = 0; iter < 4 * n + 4; iter++)
+            {
+                // residual gradient: g_j = (G^T (h − G s))_j
+                var r = new double[n];
+                for (int i = 0; i < n; i++)
+                {
+                    double acc = h[i];
+                    for (int j = 0; j < n; j++) acc -= G[i, j] * s[j];
+                    r[i] = acc;
+                }
+                var grad = new double[n];
+                double gnorm = 0;
+                for (int j = 0; j < n; j++)
+                {
+                    double acc = 0;
+                    for (int i = 0; i < n; i++) acc += G[i, j] * r[i];
+                    grad[j] = acc;
+                    gnorm += acc * acc;
+                }
+                // candidate: largest positive gradient outside the set
+                int jNew = -1;
+                double best = 1e-12 * Math.Max(1.0, Math.Sqrt(gnorm));
+                for (int j = 0; j < n; j++)
+                    if (!inSet[j] && grad[j] > best) { best = grad[j]; jNew = j; }
+                if (jNew < 0) break; // converged
+                inSet[jNew] = true;
+
+                // inner loop: solve G_PP s_P = h_P; if any component < 0, drop the
+                // most negative index and re-solve; when all ≥ 0, apply and go back
+                // to the gradient test (NOT terminate — other variables may still
+                // improve the fit).
+                for (int inner = 0; inner < n + 1; inner++)
+                {
+                    var idx = new List<int>();
+                    for (int j = 0; j < n; j++) if (inSet[j]) idx.Add(j);
+                    int m = idx.Count;
+                    var A = new double[m, m];
+                    var b = new double[m];
+                    for (int i = 0; i < m; i++)
+                    {
+                        b[i] = h[idx[i]];
+                        for (int j = 0; j < m; j++) A[i, j] = G[idx[i], idx[j]];
+                    }
+                    double[] sp = SolveLinear(A, b, m);
+                    if (sp == null)
+                    {
+                        // singular active set: undo this addition and let the outer
+                        // loop pick the next candidate
+                        inSet[jNew] = false;
+                        break;
+                    }
+                    int worst = -1;
+                    double worstVal = 0;
+                    for (int i = 0; i < m; i++)
+                        if (sp[i] < worstVal) { worstVal = sp[i]; worst = i; }
+                    if (worst < 0)
+                    {
+                        for (int i = 0; i < m; i++) s[idx[i]] = sp[i];
+                        break; // apply; outer loop re-tests the gradient
+                    }
+                    inSet[idx[worst]] = false;
+                    s[idx[worst]] = 0;
+                }
+            }
+            for (int j = 0; j < n; j++) if (s[j] < 0) s[j] = 0;
+            return s;
+        }
+
+        /// <summary>
+        /// Solves the m×m system Ax=b by Gaussian elimination with partial
+        /// pivoting. Returns null if singular. m ≤ ~20 here.
+        /// </summary>
+        internal static double[] SolveLinear(double[,] A, double[] b, int m)
+        {
+            var M = new double[m, m + 1];
+            for (int i = 0; i < m; i++)
+            {
+                for (int j = 0; j < m; j++) M[i, j] = A[i, j];
+                M[i, m] = b[i];
+            }
+            for (int col = 0; col < m; col++)
+            {
+                int piv = col;
+                for (int row = col + 1; row < m; row++)
+                    if (Math.Abs(M[row, col]) > Math.Abs(M[piv, col])) piv = row;
+                if (Math.Abs(M[piv, col]) < 1e-14) return null;
+                if (piv != col)
+                    for (int j = 0; j <= m; j++)
+                    {
+                        double t = M[col, j]; M[col, j] = M[piv, j]; M[piv, j] = t;
+                    }
+                for (int row = col + 1; row < m; row++)
+                {
+                    double f = M[row, col] / M[col, col];
+                    for (int j = col; j <= m; j++) M[row, j] -= f * M[col, j];
+                }
+            }
+            var x = new double[m];
+            for (int i = m - 1; i >= 0; i--)
+            {
+                double acc = M[i, m];
+                for (int j = i + 1; j < m; j++) acc -= M[i, j] * x[j];
+                x[i] = acc / M[i, i];
+            }
+            return x;
+        }
+
+        /// <summary>
         /// Greedy forward selection (orthogonal matching pursuit) over the scalar
         /// light fields. Each round picks the unused light whose 1D projection onto
         /// the current residual has the largest weighted gain, and subtracts it.
@@ -1096,6 +1294,63 @@ namespace JKDecompiler.Core
                     double level = el.TryGetProperty("level", out var lv) ? lv.GetDouble() : 1024;
                     var p = new Vector3(pos[0].GetSingle(), pos[1].GetSingle(), pos[2].GetSingle());
                     var name = el.TryGetProperty("name", out var nm) ? nm.GetString() ?? "lm" : "lm";
+
+                    // Push seeds out of solids: a seed placed inside a wall/slab
+                    // has its light culled or nudged by q3map2 (measured: culled
+                    // seeds bake byte-identical fields; nudged ones bake displaced
+                    // pools that correlate ~0.04 with the target instead of ~0.2+).
+                    // Push IN-PLANE first (8 directions in the face's tangent plane,
+                    // capped at the seed radius) so the light keeps pool height —
+                    // pushing along the normal crosses tall pillars/beams (academy1
+                    // has a 5464u beam through the floor) and leaves the light
+                    // farther than its radius from the pool, baking nothing there.
+                    // Only if no in-plane escape falls back to a short normal push.
+                    var n = el.TryGetProperty("normal", out var nrm)
+                        ? new Vector3(nrm[0].GetSingle(), nrm[1].GetSingle(), nrm[2].GetSingle())
+                        : Vector3.Zero;
+                    if (Vector3.Dot(n, n) < 0.5) n = Vector3.Zero;
+                    if (PointInWorldSolid(origBsp, p) && Vector3.Dot(n, n) >= 0.5)
+                    {
+                        var nn = Vector3.Normalize(n);
+                        // tangent frame: any orthonormal basis perpendicular to n
+                        var help = Math.Abs(nn.Z) < 0.9 ? Vector3.UnitZ : Vector3.UnitX;
+                        var u = Vector3.Normalize(Vector3.Cross(nn, help));
+                        var v = Vector3.Cross(nn, u);
+                        Vector3? escape = null;
+                        int escDir = -1, escDist = 0;
+                        int radCap = (int)Math.Min(512, Math.Max(16,
+                            el.TryGetProperty("radius", out var rd2) ? rd2.GetDouble() : 256));
+                        for (int dir = 0; dir < 8 && escape == null; dir++)
+                        {
+                            double ang = dir * Math.PI / 4;
+                            var d = u * (float)Math.Cos(ang) + v * (float)Math.Sin(ang);
+                            for (int dd = 8; dd <= radCap; dd += 8)
+                            {
+                                var q = p + d * dd;
+                                if (!PointInWorldSolid(origBsp, q)) { escape = q; escDir = dir; escDist = dd; break; }
+                            }
+                        }
+                        if (escape != null)
+                        {
+                            p = escape.Value;
+                            Console.Error.WriteLine($"[seeds] {name}: pushed {escDist}u in-plane dir{escDir} (was in solid)");
+                        }
+                        else
+                        {
+                            int pushed = 0;
+                            for (int i = 0; i < 16 && PointInWorldSolid(origBsp, p); i++)
+                            {
+                                p += n * Options.PosStep;
+                                pushed++;
+                            }
+                            if (PointInWorldSolid(origBsp, p))
+                            {
+                                Console.Error.WriteLine($"[seeds] {name}: DROPPED — in solid, no escape within radius (in-plane) or {16 * Options.PosStep}u normal");
+                                continue;
+                            }
+                            Console.Error.WriteLine($"[seeds] {name}: pushed {pushed * Options.PosStep}u along normal (in-plane failed)");
+                        }
+                    }
                     lights.Add(new FitLight
                     {
                         Name = name,
@@ -1447,18 +1702,25 @@ namespace JKDecompiler.Core
             var (greedyOrder, gscales) = FitGreedy1D(pairs, ambientExt, basis, nB);
             if (greedyOrder.Count >= 2)
             {
+                // Non-negative least squares (Lawson–Hanson) on the selected set.
+                // The joint normal equations for overlapping monochrome pools are
+                // ill-conditioned (naive Gaussian elimination collapsed every scale
+                // to ~0 on academy1; unclamped BCD oscillates: 42.86→41.47→42.17
+                // vs greedy 41.20). NNLS solves the box-constrained problem exactly
+                // and is guaranteed ≤ the error of any feasible point — including
+                // the ambient-only zero vector and the clamped greedy solution.
                 var (Gp, hp) = BuildGh1D(pairs, ambientExt, basis, greedyOrder);
                 double trp = 0;
                 int np = Gp.GetLength(0);
                 for (int i = 0; i < np; i++) trp += Gp[i, i];
-                double[] xp = SolveLeastSquares(Gp, np, hp, Math.Max(1e-4, (trp / np) * 1e-6));
-                var polished = new double[nB];
-                for (int k = 0; k < greedyOrder.Count; k++)
-                    polished[greedyOrder[k]] = Math.Max(0, xp[k]);
-                double rmsPolished = RmsOf1D(pairs, basis, polished, ambientExt);
+                double ridge = 1e-3 * Math.Max(1.0, trp / np);
                 double rmsGreedy = RmsOf1D(pairs, basis, gscales, ambientExt);
-                if (rmsPolished <= rmsGreedy)
-                    gscales = polished;
+                var xs = NnlsSolve(Gp, hp, ridge);
+                for (int k = 0; k < greedyOrder.Count; k++)
+                    gscales[greedyOrder[k]] = xs[k];
+                double rmsPolished = RmsOf1D(pairs, basis, gscales, ambientExt);
+                Console.Error.WriteLine($"[polish] NNLS greedyRms={rmsGreedy:F4} after={rmsPolished:F4} (ridge {ridge:F4}) scales=" +
+                    string.Join(" ", greedyOrder.ConvertAll(a => $"{a}:{gscales[a]:F3}")));
             }
             double rmsFit = RmsOf1D(pairs, basis, gscales, ambientExt);
             var scales = new double[nL][];
@@ -1660,7 +1922,7 @@ namespace JKDecompiler.Core
                 }
                 if (valid != null) valid[i] = true;
                 var (u, v) = WorldToUv(f, new SamplePoint { X = p.X, Y = p.Y, Z = p.Z });
-                var c = SampleBlock(cand.Lightmaps[f.Block].Data, u, v);
+                var c = SampleFaceValue(cand.Lightmaps[f.Block].Data, f, u, v);
                 vals.Add((c.R, c.G, c.B));
             }
             return vals;
