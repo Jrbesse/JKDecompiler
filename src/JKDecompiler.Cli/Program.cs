@@ -227,7 +227,9 @@ static class RunCli
         if (r.Lights.Count(l => !l.Kept) > 10)
             Console.WriteLine($"  ... and {r.Lights.Count(l => !l.Kept) - 10} more dropped");
         if (!string.IsNullOrEmpty(r.Note)) Console.WriteLine($"  note: {r.Note}");
-        Console.WriteLine($"wrote fit.map + fit_report.json + fit_lights_overlay.png + lightmap_diff.png to {Path.GetFullPath(pos[4])}");
+        var arts = new[] { "fit.map", "fit_report.json", "fit_lights_overlay.png" };
+        if (r.DiffWritten) arts = arts.Append("lightmap_diff.png").ToArray();
+        Console.WriteLine($"wrote {string.Join(" + ", arts)} to {Path.GetFullPath(pos[4])}");
         return r.ErrorFinal < r.ErrorAmbientOnly ? 0 : 1;
     }
 

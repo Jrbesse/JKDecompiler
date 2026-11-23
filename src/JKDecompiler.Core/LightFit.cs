@@ -82,6 +82,7 @@ namespace JKDecompiler.Core
         public List<FitLight> Lights = new();
         public int CompilesRun;
         public long ElapsedMs;
+        public bool DiffWritten;            // lightmap_diff.png actually emitted (a comparable candidate BSP existed)
         public string Note = "";
     }
 
@@ -1822,14 +1823,24 @@ namespace JKDecompiler.Core
             else
             {
                 res.Note = "stage A compile produced no lightmaps: " + Tail(stageA.Log, 400);
-                WriteReport(outDir, baseMapPath, mapLabel, lights, origBsp, c0, res, pairs, singleFields, null, 0);
+                // No candidate field to diff; show original vs ambient-only (probe) —
+                // still the pool-residual picture, and keeps the artifact list honest.
+                WriteReport(outDir, baseMapPath, mapLabel, lights, origBsp, c0, res, pairs, singleFields, probeBsp, 0);
                 return res;
             }
             if (res.ErrorStageA >= res.ErrorAmbientOnly)
             {
                 res.Note = $"fitted lights do not beat ambient-only (E_fit={res.ErrorStageA:F2} >= E_ambient={res.ErrorAmbientOnly:F2}) — emitting empty light set";
                 foreach (var l in lights) if (l.Kept) { l.Kept = false; l.DropReason = "did not beat ambient-only"; }
-                WriteReport(outDir, baseMapPath, mapLabel, lights, origBsp, c0, res, pairs, singleFields, null, 0);
+                // The emitted final set is empty: the final map IS the ambient-only
+                // map, so its error is the ambient baseline. (Leaving ErrorFinal=0
+                // made the CLI exit code 0 on a gate FAIL.)
+                res.ErrorFinal = res.ErrorAmbientOnly;
+                // Diff the original against the stage-A candidate field: this is the
+                // residual map the next fit iteration works from (pooled = geometry,
+                // broad soft = bounce). Previously null → lightmap_diff.png silently
+                // missing on every gate-fail run (fitrun9).
+                WriteReport(outDir, baseMapPath, mapLabel, lights, origBsp, c0, res, pairs, singleFields, stageABsp, 0);
                 WriteFitMap(baseText, lights, outDir, mapLabel, Options.WriteJkaFormat);
                 return res;
             }
@@ -2201,7 +2212,10 @@ namespace JKDecompiler.Core
                 JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true }));
             WriteOverlay(outDir, lights, origBsp, mapLabel);
             if (finalBsp != null)
+            {
                 WriteBlockDiff(outDir, origBsp, finalBsp, mapLabel);
+                res.DiffWritten = true;
+            }
         }
 
         /// <summary>Top-down (XY) overlay: kept lights as +, dropped as ×.</summary>
