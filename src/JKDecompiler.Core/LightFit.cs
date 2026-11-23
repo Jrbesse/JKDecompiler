@@ -1173,13 +1173,18 @@ namespace JKDecompiler.Core
 
             // 3. compile targets: original lightmap values at shared world points
             var origFaces = BuildSampleFaces(origBsp);
-            // Probe compile WITH a dummy intensity-1 light: with zero lights
+            // Probe compile WITH a tiny dummy light: with zero lights
             // q3map2 assigns lightmaps to far fewer faces (5 blocks vs 10 on
             // academy1), so probe values would not pointwise correspond to the
             // single-light fields and every fit column would share a large
-            // global sky-mask component. The dummy contributes at most ~1 byte
-            // near the map center and decays 1/d², so the probe field is
-            // effectively the pure sky/ambient field.
+            // global sky-mask component.
+            // The dummy's level must be invisible under the ACTIVE falloff.
+            // Under JKA quadratic (atten = 1-(d/r)^2) a level-1 light bakes a
+            // ~255 dome across its 1024u radius (measured: E_ambient 123.58
+            // with it vs 18.72 without — the worldspawn ambient is fine, the
+            // whole excess was the dummy). Level 0.01 adds a negligible few
+            // tenths of a byte at the peak and stays indistinguishable from
+            // the pure sky/ambient field.
             double vminx = double.MaxValue, vminy = double.MaxValue, vminz = double.MaxValue;
             double vmaxx = double.MinValue, vmaxy = double.MinValue, vmaxz = double.MinValue;
             foreach (var v in origBsp.Vertices)
@@ -1196,7 +1201,10 @@ namespace JKDecompiler.Core
                 SeedPosition = center,
                 Position = center,
                 Style = 0,
-                Scale = new[] { 1.0, 1.0, 1.0 },
+                // 0.01, not 1.0: invisible under the JKA quadratic falloff
+                // (a level-1 dummy bakes a ~255 dome — see above), but still
+                // non-zero, so lightmap assignment is forced as before.
+                Scale = new[] { 0.01, 0.01, 0.01 },
             };
             string probeName = $"fit_probe";
             string probeText = baseText + "\n// fit probe (dummy ambient-referenced light)\n"
