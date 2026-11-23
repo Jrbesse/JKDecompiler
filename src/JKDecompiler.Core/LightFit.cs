@@ -1197,6 +1197,17 @@ namespace JKDecompiler.Core
                 vminz = Math.Min(vminz, v.Position.Z); vmaxz = Math.Max(vmaxz, v.Position.Z);
             }
             var center = new Vector3((float)((vminx + vmaxx) / 2), (float)((vminy + vmaxy) / 2), (float)((vminz + vmaxz) / 2));
+            // The dummy's radius must SPAN the map: q3map2 only assigns
+            // lightmaps to faces touched by a light's envelope, and
+            // BuildProbePairs is probe-driven (sample points live on probe
+            // texels). At the old fixed 1024u the probe covered only the
+            // central 10 of academy1's 24 blocks, so every seed pool outside
+            // that sphere had zero field on the sample set and the fit could
+            // never see it (measured: 6/20 single fields byte-identical dead
+            // while their compiles were healthy 10-block bakes).
+            double dummyR = Math.Sqrt(Math.Pow((vmaxx - vminx) / 2, 2)
+                + Math.Pow((vmaxy - vminy) / 2, 2)
+                + Math.Pow((vmaxz - vminz) / 2, 2)) * 1.05;
             var dummy = new FitLight
             {
                 Name = "__fit_dummy__",
@@ -1208,6 +1219,7 @@ namespace JKDecompiler.Core
                 // (a level-1 dummy bakes a ~255 dome — see above), but still
                 // non-zero, so lightmap assignment is forced as before.
                 Scale = new[] { 0.01, 0.01, 0.01 },
+                Radius = (int)Math.Ceiling(Math.Min(8192, dummyR)),
             };
             string probeName = $"fit_probe";
             string probeText = baseText + "\n// fit probe (dummy ambient-referenced light)\n"
@@ -1274,15 +1286,25 @@ namespace JKDecompiler.Core
                         string nm = $"fit_s{idx:D3}";
                         var c = CompileMap(variant, nm, scratchRoot, out BspData? bsp);
                         logs[idx] = c.Log;
-                        var raw = c.HasLightmaps && bsp != null
-                            ? SampleCandidate(bsp, BuildSampleFaces(bsp), pairs)
-                            : Enumerable.Repeat((R: 0.0, G: 0.0, B: 0.0), pairs.Count).ToList();
-                        // strip the baked ambient → pure per-light contribution
+                        var raw = new List<(double R, double G, double B)>(pairs.Count);
+                        var have = new bool[pairs.Count];
+                        if (c.HasLightmaps && bsp != null)
+                        {
+                            var candFaces = BuildSampleFaces(bsp);
+                            raw = SampleCandidate(bsp, candFaces, pairs, have);
+                        }
+                        // strip the baked ambient → pure per-light contribution.
+                        // Points with no lightmap in the single compile get 0
+                        // (the light contributed nothing there — subtracting
+                        // the probe's baked ambient would inject a fake
+                        // negative lobe of -65).
                         var vals = new List<(double R, double G, double B)>(raw.Count);
                         for (int q = 0; q < raw.Count; q++)
-                            vals.Add((raw[q].R - ambientVals[q].R,
-                                      raw[q].G - ambientVals[q].G,
-                                      raw[q].B - ambientVals[q].B));
+                            vals.Add(have[q]
+                                ? (raw[q].R - ambientVals[q].R,
+                                   raw[q].G - ambientVals[q].G,
+                                   raw[q].B - ambientVals[q].B)
+                                : (R: 0.0, G: 0.0, B: 0.0));
                         fields[idx] = vals;
                         Interlocked.Increment(ref res.CompilesRun);
                         if (Environment.GetEnvironmentVariable("JKD_SAMPDBG") == "1")
@@ -1602,8 +1624,16 @@ namespace JKDecompiler.Core
             return Math.Clamp(c * (ch == 0 ? 1.0 : ratio), 0, 255);
         }
 
-        /// <summary>Sample a candidate BSP's lightmap at the shared world points (black where absent).</summary>
-        internal List<(double R, double G, double B)> SampleCandidate(BspData cand, List<SampleFace> candFaces, List<SamplePair> pairs)
+        /// <summary>
+        /// Sample a candidate BSP's lightmap at the shared world points (black
+        /// where absent). When <paramref name="valid"/> is supplied it is
+        /// filled with whether a lightmapped face actually existed at each
+        /// point — the single-field construction masks those points to zero,
+        /// because a point with no lightmap in the single compile means the
+        /// light contributed nothing there (the raw 0 minus the probe's 65
+        /// ambient would otherwise inject a fake negative lobe).
+        /// </summary>
+        internal List<(double R, double G, double B)> SampleCandidate(BspData cand, List<SampleFace> candFaces, List<SamplePair> pairs, bool[]? valid = null)
         {
             // Locate the candidate face spatially (face-array indices shift
             // when UV packing splits faces, so index matching is unsafe), then
@@ -1612,10 +1642,17 @@ namespace JKDecompiler.Core
             // the layout differs (e.g. the final multi-light compile).
             var spatial = new CandidateIndex(candFaces);
             var vals = new List<(double, double, double)>(pairs.Count);
-            foreach (var p in pairs)
+            for (int i = 0; i < pairs.Count; i++)
             {
+                var p = pairs[i];
                 var f = spatial.Find(p.X, p.Y, p.Z);
-                if (f == null) { vals.Add((0, 0, 0)); continue; }
+                if (f == null)
+                {
+                    if (valid != null) valid[i] = false;
+                    vals.Add((0, 0, 0));
+                    continue;
+                }
+                if (valid != null) valid[i] = true;
                 (double u, double v) = (f.Block == p.PBlock)
                     ? (p.PU, p.PV)
                     : WorldToUv(f, new SamplePoint { X = p.X, Y = p.Y, Z = p.Z });
