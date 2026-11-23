@@ -2047,7 +2047,12 @@ namespace JKDecompiler.Core
             else
             {
                 var (cr, cg, cb) = l.Color01;
-                sb.AppendLine($"  \"light\" \"{l.Intensity:0.#}\"");
+                // 0.### — NOT 0.#: the probe dummy uses level 0.01, which the
+                // 1-decimal format truncates to "0" (a dead light that no
+                // longer forces lightmap assignment: 6 blocks vs 10 on
+                // academy1, and the probe-driven sample set collapses onto
+                // the probe's few lit regions).
+                sb.AppendLine($"  \"light\" \"{l.Intensity:0.###}\"");
                 sb.AppendLine($"  \"_color\" \"{cr:0.000} {cg:0.000} {cb:0.000}\"");
             }
             sb.AppendLine($"  \"lightstyle\" \"{l.Style}\"");
