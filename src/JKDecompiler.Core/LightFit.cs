@@ -1035,7 +1035,10 @@ namespace JKDecompiler.Core
         {
             var psi = new ProcessStartInfo
             {
-                FileName = Q3map2Bin,
+                // Absolute path: the garux fork resolves its VFS base path from
+                // the executable path; a relative binary fails at startup with
+                // "Failed to find a valid base path" (exit 1).
+                FileName = Path.GetFullPath(Q3map2Bin),
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
