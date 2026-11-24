@@ -164,6 +164,66 @@ public class SkyboxReconstructionTests
     }
 
     [Fact]
+    public void RetextureSky_ExplicitTarget_UsesGivenName()
+    {
+        // the no-sky A/B compile re-textures to the zero-photon overlay
+        string map = """
+            {
+                "classname" "worldspawn"
+                {
+                    ( 0 0 0 ) ( 10 0 0 ) ( 10 10 0 ) skies/yavin 0 0 0 1 1 0 0 0
+                }
+            }
+            """;
+        var (text, count) = SkyboxReconstruction.RetextureSky(map, new[] { "skies/yavin" }, SkyboxReconstruction.TextureNameNoSky);
+        Assert.Equal(1, count);
+        Assert.Contains("fit/sky0", text);
+        Assert.DoesNotContain(" fit/sky ", text);
+        Assert.DoesNotContain("skies/yavin", text);
+    }
+
+    [Fact]
+    public void InstallShader_CustomSkyLightValue_WritesValue()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "jk_skytest_" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            string path = SkyboxReconstruction.InstallShader(dir, "textures/skies/yavin", 270.0);
+            string text = File.ReadAllText(path);
+            Assert.Contains("q3map_skyLight     270 16 -90 90 1", text);
+            // changed value → the file is rewritten (not left stale)
+            SkyboxReconstruction.InstallShader(dir, "textures/skies/yavin", 150.0);
+            Assert.Contains("q3map_skyLight     150 16 -90 90 1", File.ReadAllText(path));
+        }
+        finally
+        {
+            if (Directory.Exists(dir)) Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
+    public void InstallShaderNoSky_ZeroPhotons()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "jk_skytest_" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            string path = SkyboxReconstruction.InstallShaderNoSky(dir, "textures/skies/yavin");
+            Assert.Equal(Path.Combine(dir, "base", "shaders", "fit_sky0.shader"), path);
+            string text = File.ReadAllText(path);
+            Assert.Contains("textures/fit/sky0", text);
+            Assert.Contains("q3map_skyLight     0 16 -90 90 1", text);
+            Assert.Contains("textures/skies/yavin 512 -", text);
+            // idempotent
+            string path2 = SkyboxReconstruction.InstallShaderNoSky(dir, "textures/skies/yavin");
+            Assert.Equal(text, File.ReadAllText(path2));
+        }
+        finally
+        {
+            if (Directory.Exists(dir)) Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
     public void InstallShader_WritesOverlayWithSkyLightKey()
     {
         var dir = Path.Combine(Path.GetTempPath(), "jk_skytest_" + Guid.NewGuid().ToString("N"));
