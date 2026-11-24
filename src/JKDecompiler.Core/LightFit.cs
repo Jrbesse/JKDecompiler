@@ -636,6 +636,66 @@ namespace JKDecompiler.Core
                 }
                 return best;
             }
+
+            /// <summary>
+            /// Loose plane tolerance for dense original-driven pairs. The
+            /// recompiled BSP's interior is offset from the original by a few
+            /// to ~20 units (decompiler brush recovery is not injective), and
+            /// recompiled BSPs drop the sky-box faces entirely, so the strict
+            /// 1.5u plane match misses ~40% of original texels (measured on
+            /// academy1: 120k interior points with no strict probe face,
+            /// offset histogram 3-8u:25k, 9-19u:19k, ≥20u:rest).
+            /// </summary>
+            public const double LoosePlane = 24.0;
+
+            /// <summary>
+            /// Tolerant variant of Find: same 27-cell window, but accepts any
+            /// face whose plane is within <paramref name="maxPlane"/> of the
+            /// point and whose normal agrees with the point's original face
+            /// normal (|n·no| ≥ 0.98 — parallel surfaces qualify; the strict
+            /// path already took the exact-plane ones). Closest plane wins,
+            /// center distance breaks ties. Ambient is a smooth spatial field,
+            /// so a neighbor up to 24u off the true surface reads the local
+            /// ambient to within the light falloff gradient — far better than
+            /// the global-mean fill the strict path fell back to.
+            /// </summary>
+            public SampleFace? FindLoose(double x, double y, double z,
+                double nx, double ny, double nz, double maxPlane)
+            {
+                var strict = Find(x, y, z);
+                if (strict != null) return strict;
+                long cx = (long)Math.Floor(x / Cell), cy = (long)Math.Floor(y / Cell), cz = (long)Math.Floor(z / Cell);
+                SampleFace? best = null;
+                double bestPlane = double.MaxValue, bestD = double.MaxValue;
+                for (long dx = -1; dx <= 1; dx++)
+                for (long dy = -1; dy <= 1; dy++)
+                for (long dz = -1; dz <= 1; dz++)
+                {
+                    long key = ((cx + dx) << 21) ^ ((cy + dy) << 10) ^ (cz + dz);
+                    if (!_cells.TryGetValue(key, out var l)) continue;
+                    foreach (var f in l)
+                    {
+                        double plane = Math.Abs(f.Normal.X * x + f.Normal.Y * y + f.Normal.Z * z - f.PlaneDist);
+                        if (plane > maxPlane) continue;
+                        double ndot = Math.Abs(f.Normal.X * nx + f.Normal.Y * ny + f.Normal.Z * nz);
+                        if (ndot < 0.98) continue;
+                        var o = f.FrameOrigin;
+                        var u = f.FrameU; var v = f.FrameV;
+                        double ddx = x - o.X, ddy = y - o.Y, ddz = z - o.Z;
+                        double px = ddx * u.X + ddy * u.Y + ddz * u.Z;
+                        double py = ddx * v.X + ddy * v.Y + ddz * v.Z;
+                        if (!PointInHull(f.Hull2D, px, py, 2.0 + 0.1 * maxPlane)) continue;
+                        var (fu, fv) = WorldToUv(f, new SamplePoint { X = x, Y = y, Z = z });
+                        double m = 2.0 / 127.0;
+                        if (fu < f.UMin - m || fu > f.UMax + m || fv < f.VMin - m || fv > f.VMax + m) continue;
+                        double cdx = f.Center.X - x, cdy = f.Center.Y - y, cdz = f.Center.Z - z;
+                        double d = cdx * cdx + cdy * cdy + cdz * cdz;
+                        if (plane < bestPlane || (plane == bestPlane && d < bestD))
+                        { best = f; bestPlane = plane; bestD = d; }
+                    }
+                }
+                return best;
+            }
         }
 
         // ------------------------------------------------------------------
@@ -659,9 +719,14 @@ namespace JKDecompiler.Core
         /// discarded even provably-correct seeds (fitrun11/13: ΔE≈0 for every
         /// light while face-level joins showed corr 0.85+).
         /// Targets are the original texels exactly (direct block read); ambient
-        /// is the probe field at the same world point (the probe's dummy light
-        /// spans the map, so every face has a probe lightmap). Candidates are
-        /// still sampled through their own world→UV affine (SampleCandidate).
+        /// is the probe field at the same world point, read through the loose
+        /// plane match (the recompiled interior is offset 3-24u from the
+        /// original and sky-box faces are absent from recompiled BSPs — the
+        /// strict match missed ~40% of texels). The remainder — sky-box
+        /// texels and offsets beyond the tolerance — get the local ambient
+        /// from matched neighbors (64u/96u, then the global mean). Candidates
+        /// are still sampled through their own world→UV affine
+        /// (SampleCandidate, loose as well).
         /// </summary>
         internal (List<SamplePair> Pairs, int Unmatched, int Matched)
             BuildOrigPairs(BspData orig, List<SampleFace> origFaces, BspData probe, List<SampleFace> probeFaces)
@@ -718,7 +783,8 @@ namespace JKDecompiler.Core
                         double wz = of.FrameOrigin.Z + of.FrameU.Z * px + of.FrameV.Z * py;
                         int o3 = (y * 128 + x) * 3;
                         byte or_ = block[o3], og = block[o3 + 1], ob = block[o3 + 2];
-                        var pf = pidx.Find(wx, wy, wz);
+                        var pf = pidx.FindLoose(wx, wy, wz, of.Normal.X, of.Normal.Y, of.Normal.Z,
+                            CandidateIndex.LoosePlane);
                         int pface = -1, pblock = -1; double pu = 0, pv = 0;
                         byte pr = 0, pg = 0, pb = 0;
                         if (pf != null)
@@ -740,20 +806,65 @@ namespace JKDecompiler.Core
                     }
                 }
             }
-            // Points whose probe face wasn't located (UV jitter at edges):
-            // fill with the mean matched ambient so the target still counts.
+            // Points with no probe face even under the loose plane test —
+            // sky-box faces (recompiled BSPs drop them) and interior offsets
+            // beyond the tolerance: fill with the LOCAL ambient, the mean of
+            // matched probe values within 64u, then 96u, then the global
+            // mean. The ambient field is smooth over tens of units, so a
+            // nearby matched value is a faithful local estimate; the old
+            // global mean was wrong by up to ~30 at sky-adjacent and
+            // pool-adjacent texels and inflated the ambient-only baseline.
             if (noAmb.Count > 0)
             {
+                const int Ac = 32;
+                var ambGrid = new Dictionary<long, List<int>>();
+                for (int i = 0; i < pairs.Count; i++)
+                {
+                    if (pairs[i].PFace < 0) continue;
+                    var p = pairs[i];
+                    long key = ((long)Math.Floor(p.X / Ac) << 21) ^ ((long)Math.Floor(p.Y / Ac) << 10) ^ (long)Math.Floor(p.Z / Ac);
+                    if (!ambGrid.TryGetValue(key, out var l)) ambGrid[key] = l = new List<int>();
+                    l.Add(i);
+                }
                 double ar = 0, ag = 0, ab = 0; int am = 0;
                 foreach (var p in pairs)
                 {
                     if (p.PFace < 0) continue;
                     ar += p.CR; ag += p.CG; ab += p.CB; am++;
                 }
-                if (am > 0)
+                var mean = (R: ar / Math.Max(1, am), G: ag / Math.Max(1, am), B: ab / Math.Max(1, am));
+                foreach (int idx in noAmb)
                 {
-                    byte fr = (byte)(ar / am), fg = (byte)(ag / am), fb = (byte)(ab / am);
-                    foreach (int i in noAmb) pairs[i] = pairs[i] with { CR = fr, CG = fg, CB = fb };
+                    var p = pairs[idx];
+                    long cx = (long)Math.Floor(p.X / Ac), cy = (long)Math.Floor(p.Y / Ac), cz = (long)Math.Floor(p.Z / Ac);
+                    (double r, double g, double b)? found = null;
+                    for (int rad = 2; rad <= 3 && found == null; rad++)
+                    {
+                        double sr = 0, sg = 0, sb = 0; int sn = 0;
+                        double lim = rad * 32.0;
+                        for (long dx = -rad; dx <= rad; dx++)
+                        for (long dy = -rad; dy <= rad; dy++)
+                        for (long dz = -rad; dz <= rad; dz++)
+                        {
+                            long k = ((cx + dx) << 21) ^ ((cy + dy) << 10) ^ (cz + dz);
+                            if (!ambGrid.TryGetValue(k, out var l)) continue;
+                            foreach (int j in l)
+                            {
+                                var q = pairs[j];
+                                double ddx = q.X - p.X, ddy = q.Y - p.Y, ddz = q.Z - p.Z;
+                                if (ddx * ddx + ddy * ddy + ddz * ddz > lim * lim) continue;
+                                sr += q.CR; sg += q.CG; sb += q.CB; sn++;
+                            }
+                        }
+                        if (sn > 0) found = (sr / sn, sg / sn, sb / sn);
+                    }
+                    var val = found ?? mean;
+                    pairs[idx] = p with
+                    {
+                        CR = (byte)Math.Clamp(Math.Round(val.r), 0, 255),
+                        CG = (byte)Math.Clamp(Math.Round(val.g), 0, 255),
+                        CB = (byte)Math.Clamp(Math.Round(val.b), 0, 255)
+                    };
                 }
             }
             return (pairs, unmatched, matched);
@@ -1731,8 +1842,32 @@ namespace JKDecompiler.Core
                 constField.Add((1.0, 1.0, 1.0));
             }
             var corrBasis = new List<LightBasis> { BuildBasis(skyField), BuildBasis(constField) };
+            // Mask the POOL points out of the sky/constant fit: on the dense
+            // set the constant term absorbs the MEAN POOL ENERGY (fitrun14:
+            // offset 34.19/ch — pools are ~25% of texels at +150), because the
+            // LSQ over all points trades it against the pools. The correction
+            // is then frozen into ambientExt while the stage-A recompile never
+            // adds it back, so every captured pool is ~34 short and the gate
+            // error explodes (190 vs 104). The lights own the pool regions;
+            // [sky, constant] must only see non-pool points.
+            var poolW = new List<(int Id, double W)>();
+            for (int id = 0; id < pairs.Count; id++)
+            {
+                bool inPool = false;
+                for (int l = 0; l < singleFields.Count && !inPool; l++)
+                {
+                    var f = singleFields[l][id];
+                    inPool = Math.Max(Math.Abs(f.R), Math.Max(Math.Abs(f.G), Math.Abs(f.B))) > 8.0;
+                }
+                if (inPool)
+                {
+                    poolW.Add((id, pairs[id].Weight));
+                    pairs[id] = pairs[id] with { Weight = 0 };
+                }
+            }
             var (Gc, hc) = BuildGh1D(pairs, ambientVals, corrBasis, new List<int> { 0, 1 });
             double[] xc = SolveLeastSquares(Gc, 2, hc, 1e-9 * Math.Max(1.0, (Gc[0, 0] + Gc[1, 1]) / 2));
+            foreach (var (id, w) in poolW) pairs[id] = pairs[id] with { Weight = w };
             res.SkyGain = xc[0];
             res.SkyOffset = xc[1];
             Console.Error.WriteLine($"[sky] step correction: gain={xc[0]:F4} offset={xc[1]:F3}/ch");
@@ -1873,7 +2008,21 @@ namespace JKDecompiler.Core
             res.CompilesRun++;
             if (stageABsp != null && stageABsp.Lightmaps.Count > 0)
             {
-                var vals = SampleCandidate(stageABsp, BuildSampleFaces(stageABsp), pairs);
+                // Points the recompile can't sample (sky box, offsets beyond
+                // the loose tolerance) get the linear model value so the gate
+                // error is not inflated by zeros.
+                var vals = SampleCandidate(stageABsp, BuildSampleFaces(stageABsp), pairs,
+                    modelFill: i =>
+                    {
+                        double r = ambientVals[i].R, g = ambientVals[i].G, b = ambientVals[i].B;
+                        for (int l = 0; l < gscales.Length; l++)
+                        {
+                            if (gscales[l] == 0) continue;
+                            var f = singleFields[l][i];
+                            r += gscales[l] * f.R; g += gscales[l] * f.G; b += gscales[l] * f.B;
+                        }
+                        return (r, g, b);
+                    });
                 res.ErrorStageA = L1Of(pairs, vals);
             }
             else
@@ -1916,7 +2065,22 @@ namespace JKDecompiler.Core
             res.CompilesRun++;
             if (finBsp != null && finBsp.Lightmaps.Count > 0)
             {
-                var vals = SampleCandidate(finBsp, BuildSampleFaces(finBsp), pairs);
+                // Same model fill as stage A. After position refinement the
+                // single fields are at the seed positions (a few units stale)
+                // — the fill covers only the handful of points the recompile
+                // cannot sample, so the staleness is immaterial.
+                var vals = SampleCandidate(finBsp, BuildSampleFaces(finBsp), pairs,
+                    modelFill: i =>
+                    {
+                        double r = ambientVals[i].R, g = ambientVals[i].G, b = ambientVals[i].B;
+                        for (int l = 0; l < gscales.Length; l++)
+                        {
+                            if (gscales[l] == 0) continue;
+                            var f = singleFields[l][i];
+                            r += gscales[l] * f.R; g += gscales[l] * f.G; b += gscales[l] * f.B;
+                        }
+                        return (r, g, b);
+                    });
                 res.ErrorFinal = L1Of(pairs, vals);
                 if (res.ErrorFinal > res.ErrorStageA)
                 {
@@ -1953,13 +2117,23 @@ namespace JKDecompiler.Core
         }
 
         /// <summary>
-        /// Sample a candidate BSP's lightmap at the shared world points (black
-        /// where absent). When <paramref name="valid"/> is supplied it is
-        /// filled with whether a lightmapped face actually existed at each
-        /// point — the single-field construction masks those points to zero,
-        /// because a point with no lightmap in the single compile means the
-        /// light contributed nothing there (the raw 0 minus the probe's 65
+        /// Sample a candidate BSP's lightmap at the shared world points.
+        /// Faces are located with the LOOSE plane match (the recompiled
+        /// geometry is offset 3-24u from the original; the strict match
+        /// missed ~40% of dense points and turned their values into 0,
+        /// which on the stage-A recompile inflated the measured error to
+        /// ~190 vs the 104 ambient baseline — fitrun14).
+        /// When <paramref name="valid"/> is supplied it is filled with
+        /// whether a lightmapped face actually existed at each point — the
+        /// single-field construction masks those points to zero, because a
+        /// point with no lightmap in the single compile means the light
+        /// contributed nothing there (the raw 0 minus the probe's 65
         /// ambient would otherwise inject a fake negative lobe).
+        /// When <paramref name="modelFill"/> is supplied it is called for
+        /// points where even the loose match fails and its value is used —
+        /// the linear model (ambient + fitted lights) at that point — so a
+        /// stage-A/final error measurement is not inflated by the few
+        /// surfaces the recompile cannot sample (sky box, far offsets).
         ///
         /// Each point is read through the CANDIDATE's own world→UV affine.
         /// (An earlier version reused the probe's stored UV whenever the
@@ -1970,7 +2144,8 @@ namespace JKDecompiler.Core
         /// read the wrong page. Measured symptom: 7 different single lights
         /// with byte-identical fields and ~40% of points negative.)
         /// </summary>
-        internal List<(double R, double G, double B)> SampleCandidate(BspData cand, List<SampleFace> candFaces, List<SamplePair> pairs, bool[]? valid = null)
+        internal List<(double R, double G, double B)> SampleCandidate(BspData cand, List<SampleFace> candFaces, List<SamplePair> pairs, bool[]? valid = null,
+            Func<int, (double R, double G, double B)>? modelFill = null)
         {
             // Locate the candidate face spatially (face-array indices shift
             // when UV packing splits faces, so index matching is unsafe), then
@@ -1980,11 +2155,11 @@ namespace JKDecompiler.Core
             for (int i = 0; i < pairs.Count; i++)
             {
                 var p = pairs[i];
-                var f = spatial.Find(p.X, p.Y, p.Z);
+                var f = spatial.FindLoose(p.X, p.Y, p.Z, p.NX, p.NY, p.NZ, CandidateIndex.LoosePlane);
                 if (f == null)
                 {
                     if (valid != null) valid[i] = false;
-                    vals.Add((0, 0, 0));
+                    vals.Add(modelFill != null ? modelFill(i) : (0, 0, 0));
                     continue;
                 }
                 if (valid != null) valid[i] = true;
