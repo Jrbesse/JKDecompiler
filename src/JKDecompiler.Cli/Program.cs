@@ -158,6 +158,23 @@ static class RunCli
         return ok == rs.Count ? 0 : 1;
     }
 
+    /// <summary>
+    /// Positional args (command word removed). Values of known flags must NOT
+    /// leak into the positional list — a bare !StartsWith("--") filter leaves
+    /// them behind and shifts every positional after them (a --seeds value
+    /// lands in the scratch-dir slot, e.g.).
+    /// </summary>
+    static string[] SplitPositional(string[] args, string[] valueFlags)
+    {
+        var pos = new List<string>();
+        for (int i = 1; i < args.Length; i++)
+        {
+            if (valueFlags.Contains(args[i])) { i++; continue; } // skip flag + its value
+            if (!args[i].StartsWith("--")) pos.Add(args[i]);
+        }
+        return pos.ToArray();
+    }
+
     private static int OptI(string[] args, string name, int dflt)
     {
         int i = Array.IndexOf(args, name);
@@ -184,7 +201,7 @@ static class RunCli
     /// </summary>
     private static int FitLights(string[] args)
     {
-        var pos = args.Where(a => !a.StartsWith("--")).Skip(1).ToArray();
+        var pos = SplitPositional(args, new[] { "--max-seeds", "--parallel", "--pos-step", "--lm-size", "--seeds" });
         if (pos.Length < 5)
         {
             Console.Error.WriteLine("usage: jkdecompiler fit-lights <orig.bsp> <base.map> <q3map2-binary> <game-dir> <outdir> [scratch-dir]");
@@ -240,7 +257,7 @@ static class RunCli
     /// </summary>
     private static int RecoverLights(string[] args)
     {
-        var pos = args.Where(a => !a.StartsWith("--")).Skip(1).ToArray();
+        var pos = SplitPositional(args, new[] { "--min-cells", "--max-ray-dist", "--directed-min" });
         if (pos.Length < 2)
         {
             Console.Error.WriteLine("usage: jkdecompiler recover-lights <bsp> <outdir> [--min-cells N] [--max-ray-dist F] [--directed-min F]");

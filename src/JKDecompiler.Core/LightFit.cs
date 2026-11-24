@@ -1600,6 +1600,22 @@ namespace JKDecompiler.Core
             // 2. base map without any pre-existing lights
             string baseText = StripLightEntities(File.ReadAllText(baseMapPath));
 
+            // 2b. sky bake: the real sky brushes survive decompilation (they
+            // carry the base sky texture, e.g. skies/yavin), but the base sky
+            // shader has no sun/q3map_skyLight key, so the light stage creates
+            // no sky light and the original sky wash (96% of academy1's L1
+            // residual) is not baked. Re-texture the sky sides with the
+            // overlay skylight shader (fit/sky) and bake a real sky.
+            int skyRetextured = 0;
+            var skyTextures = SkyboxReconstruction.SkyTextureNames(origBsp);
+            if (skyTextures.Count > 0)
+            {
+                (baseText, skyRetextured) = SkyboxReconstruction.RetextureSky(baseText, skyTextures);
+                string shaderPath = SkyboxReconstruction.InstallShader(GameDir, SkyboxReconstruction.SkyImageBase(origBsp));
+                Console.Error.WriteLine($"[sky] re-textured {skyRetextured} sky sides " +
+                    $"({string.Join(", ", skyTextures)}) → {SkyboxReconstruction.TextureName}, shader {shaderPath}");
+            }
+
             // 3. compile targets: original lightmap values at shared world points
             var origFaces = BuildSampleFaces(origBsp);
             // Probe compile WITH a tiny dummy light: with zero lights
@@ -1670,6 +1686,21 @@ namespace JKDecompiler.Core
                 res.Note = "probe compile produced no lightmaps: " + Tail(probe.Log, 400);
                 WriteEmptyOutputs(outDir, baseMapPath, mapLabel, res.Note);
                 return res;
+            }
+            if (skyRetextured > 0 && !probe.Log.Contains(SkyboxReconstruction.ShaderFileName))
+            {
+                // Overlay shader absent from the VFS load: the sky sides bake no
+                // light and the fit degrades to the no-sky baseline. The fit
+                // numbers make that visible, but call it out loud here.
+                Console.Error.WriteLine("[sky] WARNING: " + SkyboxReconstruction.ShaderFileName +
+                    " not in the q3map2 load list — the sky is NOT being baked (E_ambient will match the no-sky baseline)");
+            }
+            if (skyRetextured > 0 && probeBsp.Faces.All(f =>
+                f.ShaderIndex < 0 || f.ShaderIndex >= probeBsp.Shaders.Count ||
+                probeBsp.Shaders[f.ShaderIndex].Name != "textures/" + SkyboxReconstruction.TextureName))
+            {
+                Console.Error.WriteLine("[sky] WARNING: no " + SkyboxReconstruction.TextureName +
+                    " surfaces in the probe BSP — the re-texture did not survive compilation");
             }
             var probeFaces = BuildSampleFaces(probeBsp);
             var (pairs, unmatched, matched) = BuildOrigPairs(origBsp, origFaces, probeBsp, probeFaces);
