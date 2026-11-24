@@ -1648,9 +1648,21 @@ namespace JKDecompiler.Core
                 Scale = new[] { 0.01, 0.01, 0.01 },
                 Radius = (int)Math.Ceiling(Math.Min(8192, dummyR)),
             };
+            // Every fit-side compile (probe, singles, radius candidates,
+            // stage A, final) carries this SAME dummy, so q3map2 assigns
+            // lightmaps to the identical face set in every bake — same
+            // packing, same baked per-face ambient. That is what makes the
+            // subtractions (field = single − probe; gate = original − stageA)
+            // measure the lights alone: the dummy's own bake cancels in both,
+            // and no per-face ambient jitter from differently-packed bakes
+            // contaminates them. (Without it, singles bake only the faces
+            // their light touches: fitrun18 measured corr ≈ 0.03 against the
+            // residual on a max-192 dome with ~8k points >1 below the probe
+            // ambient — the ambient difference, not the light, dominated.)
+            string dummyText = EntityText(dummy, dummy.Name, false);
             string probeName = $"fit_probe";
             string probeText = baseText + "\n// fit probe (dummy ambient-referenced light)\n"
-                + EntityText(dummy, dummy.Name, false);
+                + dummyText;
             var probe = CompileMap(probeText, probeName, scratchRoot, out BspData? probeBsp);
             res.CompilesRun++;
             if (probeBsp == null || probeBsp.Lightmaps.Count == 0)
@@ -1709,6 +1721,7 @@ namespace JKDecompiler.Core
                     try
                     {
                         string variant = baseText + "\n// fit single " + lights[idx].Name + "\n"
+                            + dummyText
                             + EntityText(lights[idx], lights[idx].Name, Options.WriteJkaFormat);
                         string nm = $"fit_s{idx:D3}";
                         var c = CompileMap(variant, nm, scratchRoot, out BspData? bsp);
@@ -1847,14 +1860,18 @@ namespace JKDecompiler.Core
                 constField.Add((1.0, 1.0, 1.0));
             }
             var corrBasis = new List<LightBasis> { BuildBasis(skyField), BuildBasis(constField) };
-            // Mask the POOL points out of the sky/constant fit: on the dense
-            // set the constant term absorbs the MEAN POOL ENERGY (fitrun14:
-            // offset 34.19/ch — pools are ~25% of texels at +150), because the
-            // LSQ over all points trades it against the pools. The correction
-            // is then frozen into ambientExt while the stage-A recompile never
-            // adds it back, so every captured pool is ~34 short and the gate
-            // error explodes (190 vs 104). The lights own the pool regions;
-            // [sky, constant] must only see non-pool points.
+            // Mask the BRIGHT points out of the sky/constant fit: the constant
+            // term absorbs whatever residual the LSQ can't fit elsewhere
+            // (fitrun14: offset 34.19/ch — bright regions are ~25% of area at
+            // +150). The correction is frozen into ambientExt while the stage-A
+            // recompile never adds it back, so the baseline sits +34 above the
+            // dark map and the gate error explodes (152 vs 103, fitrun22). The
+            // lights own the bright regions, so [sky, constant] must only see
+            // non-bright points. The field-coverage test (m>8) was the old
+            // proxy and leaks: bright points outside every field dome (wall
+            // corners, unseeded bright faces) still fed the constant. Mask by
+            // brightness directly — orig − ambient > 8 in any channel — which
+            // is what the constant is actually absorbing.
             var poolW = new List<(int Id, double W)>();
             for (int id = 0; id < pairs.Count; id++)
             {
@@ -1864,6 +1881,12 @@ namespace JKDecompiler.Core
                     var f = singleFields[l][id];
                     inPool = Math.Max(Math.Abs(f.R), Math.Max(Math.Abs(f.G), Math.Abs(f.B))) > 8.0;
                 }
+                if (!inPool)
+                {
+                    var p = pairs[id];
+                    var a = ambientVals[id];
+                    inPool = (p.OR - a.R) > 8.0 || (p.OG - a.G) > 8.0 || (p.OB - a.B) > 8.0;
+                }
                 if (inPool)
                 {
                     poolW.Add((id, pairs[id].Weight));
@@ -1871,6 +1894,37 @@ namespace JKDecompiler.Core
                 }
             }
             var (Gc, hc) = BuildGh1D(pairs, ambientVals, corrBasis, new List<int> { 0, 1 });
+            if (Environment.GetEnvironmentVariable("JKD_SKYDBG") == "1")
+            {
+                double maskW = poolW.Sum(t => t.W);
+                double totW = pairs.Sum(p => p.Weight);
+                double nw = 0, nt = 0, nsw = 0, nst = 0, nnow = 0, nnot = 0;
+                for (int id = 0; id < pairs.Count; id++)
+                {
+                    if (poolW.Any(t => t.Id == id)) continue;
+                    var p = pairs[id];
+                    double t = ((double)(p.OR - (byte)ambientVals[id].R)
+                        + (p.OG - (byte)ambientVals[id].G)
+                        + (p.OB - (byte)ambientVals[id].B)) / 3.0;
+                    double am = Math.Max(ambientVals[id].R, Math.Max(ambientVals[id].G, ambientVals[id].B));
+                    nw += p.Weight; nt += p.Weight * t;
+                    if (am >= 40) { nsw += p.Weight; nst += p.Weight * t; }
+                    else { nnow += p.Weight; nnot += p.Weight * t; }
+                }
+                Console.Error.WriteLine($"[skydbg] mask: {poolW.Count} pts maskW={maskW:F0} totW={totW:F0}");
+                Console.Error.WriteLine($"[skydbg] G00={Gc[0, 0]:F0} G01={Gc[0, 1]:F0} G11={Gc[1, 1]:F0} h0={hc[0]:F0} h1={hc[1]:F0}");
+                Console.Error.WriteLine($"[skydbg] nonpool: nW={nw:F0} meanT={nt / Math.Max(1, nw):F3} | sky nW={nsw:F0} meanT={nst / Math.Max(1, nsw):F3} | nonsky nW={nnow:F0} meanT={nnot / Math.Max(1, nnow):F3}");
+                double tR = 0, tG = 0, tB = 0;
+                for (int id = 0; id < pairs.Count; id++)
+                {
+                    var p = pairs[id];
+                    var a = ambientVals[id];
+                    tR += p.Weight * Math.Abs(p.OR - a.R);
+                    tG += p.Weight * Math.Abs(p.OG - a.G);
+                    tB += p.Weight * Math.Abs(p.OB - a.B);
+                }
+                Console.Error.WriteLine($"[skydbg] L1Of(pairs, ambient) = {L1Of(pairs, ambientVals):F4}  per-ch R={tR / totW:F2} G={tG / totW:F2} B={tB / totW:F2}  (n={pairs.Count})");
+            }
             double[] xc = SolveLeastSquares(Gc, 2, hc, 1e-9 * Math.Max(1.0, (Gc[0, 0] + Gc[1, 1]) / 2));
             foreach (var (id, w) in poolW) pairs[id] = pairs[id] with { Weight = w };
             res.SkyGain = xc[0];
@@ -2017,13 +2071,16 @@ namespace JKDecompiler.Core
             if (Options.RadiusFit && survivorsA.Count > 0)
             {
                 var sel = greedyOrder.Where(l => lights[l].Kept && gscales[l] > 0).ToList();
-                RefineRadii(pairs, singleFields, basis, lights, sel, ambientExt, gscales, baseText, scratchRoot, res);
+                RefineRadii(pairs, singleFields, basis, lights, sel, ambientExt, gscales, baseText, dummyText, scratchRoot, res);
                 for (int l = 0; l < nL; l++)
                     scales[l] = new[] { gscales[l] * basis[l].VR, gscales[l] * basis[l].VG, gscales[l] * basis[l].VB };
             }
 
             // 7b. stage A compile: all surviving lights, seed positions, fitted scales
-            string stageAMap = baseText + "\n// fit stage A\n" +
+            // (same probe-parity dummy — see above: the gate's
+            // original-vs-stageA comparison measures the lights only when the
+            // stage-A bake's packing and ambient match the probe's.)
+            string stageAMap = baseText + "\n// fit stage A\n" + dummyText +
                 string.Concat(survivorsA.Select(l => EntityText(l, l.Name, Options.WriteJkaFormat)));
             var stageA = CompileMap(stageAMap, "fit_stageA", scratchRoot, out BspData? stageABsp);
             res.CompilesRun++;
@@ -2080,7 +2137,7 @@ namespace JKDecompiler.Core
 
             // 9. final compile with kept lights at refined positions
             var kept = lights.Where(l => l.Kept).ToList();
-            string finalMap = baseText + "\n// fit final\n" +
+            string finalMap = baseText + "\n// fit final\n" + dummyText +
                 string.Concat(kept.Select(l => EntityText(l, l.Name, Options.WriteJkaFormat)));
             var fin = CompileMap(finalMap, "fit_final", scratchRoot, out BspData? finBsp);
             res.CompilesRun++;
@@ -2234,7 +2291,7 @@ namespace JKDecompiler.Core
         void RefineRadii(List<SamplePair> pairs, List<List<(double R, double G, double B)>> singleFields,
             List<LightBasis> basis, List<FitLight> lights, List<int> selected,
             List<(double R, double G, double B)> ambient, double[] gscales,
-            string baseText, string scratchRoot, LightFitResult res)
+            string baseText, string dummyText, string scratchRoot, LightFitResult res)
         {
             int nL = lights.Count;
             var gate = new SemaphoreSlim(Math.Max(1, Options.Parallel));
@@ -2267,6 +2324,7 @@ namespace JKDecompiler.Core
                             {
                                 lights[l].Radius = cands[idx];
                                 string variant = baseText + "\n// fit rad " + lights[l].Name + "\n"
+                                    + dummyText
                                     + EntityText(lights[l], lights[l].Name, Options.WriteJkaFormat);
                                 var c = CompileMap(variant, $"fit_r{l:D3}_{cands[idx]}", scratchRoot, out BspData? bsp);
                                 Interlocked.Increment(ref res.CompilesRun);
