@@ -206,7 +206,7 @@ static class RunCli
         {
             Console.Error.WriteLine("usage: jkdecompiler fit-lights <orig.bsp> <base.map> <q3map2-binary> <game-dir> <outdir> [scratch-dir]");
             Console.Error.WriteLine("  M2.5 stage 2: closed-loop fit of recovered lights against the baked lightmap");
-            Console.Error.WriteLine("  options: [--max-seeds N] [--parallel N] [--no-posfit] [--pos-step F] [--jka-format] [--lm-size N] [--sky-value N]");
+            Console.Error.WriteLine("  options: [--max-seeds N] [--seeds FILE] [--parallel N] [--no-posfit] [--no-radfit] [--pos-step F] [--jka-format] [--lm-size N] [--sky-value N]");
             return 2;
         }
         if (!File.Exists(pos[1]))

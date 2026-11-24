@@ -1188,7 +1188,6 @@ namespace JKDecompiler.Core
                 for (int id = 0; id < pairs.Count; id++) constField.Add((1.0, 1.0, 1.0));
                 var corrBasis = new List<LightBasis> { BuildBasis(skyField), BuildBasis(constField) };
                 var (Gc, hc) = BuildGh1D(pairs, ambientNoSky!, corrBasis, new List<int> { 0, 1 });
-                Gc[1, 0] = Gc[0, 1];
                 if (strong == 0)
                 {
                     // degenerate: no strong-wash points (the sky light
@@ -1240,7 +1239,6 @@ namespace JKDecompiler.Core
                     }
                 }
                 var (Gc, hc) = BuildGh1D(pairs, ambient, corrBasis, new List<int> { 0, 1 });
-                Gc[1, 0] = Gc[0, 1];
                 double[] xc = SolveLeastSquares(Gc, 2, hc, 1e-9 * Math.Max(1.0, (Gc[0, 0] + Gc[1, 1]) / 2));
                 gain = xc[0];
                 offset = xc[1];
@@ -1265,6 +1263,14 @@ namespace JKDecompiler.Core
         /// <summary>
         /// Normal equations for the scalar-scale model T ≈ sky + Σ_l s_l·G_l·v_l:
         /// G_ij = Σw·G_i·G_j·(v_i·v_j),  h_i = Σw·G_i·(t·v_i).  n×n, n = idxList.Count.
+        /// G is returned FULLY SYMMETRIC (accumulated on the upper triangle, then
+        /// mirrored): the solvers (NnlsSolve, SolveLeastSquares) read the whole
+        /// matrix, and a half-filled G silently solves a different, non-symmetric
+        /// system — on academy1's correlated wall-washer pools that flipped the
+        /// per-light partition by up to 95% relative scale while the stage-A
+        /// bake gate (bake-based) still passed (PR #13 review, re-derived on
+        /// fitrun33's saved data). Symmetry is a property of the normal
+        /// equations, so the mirror is exact, not an approximation.
         /// </summary>
         internal static (double[,] G, double[] h) BuildGh1D(List<SamplePair> pairs,
             List<(double R, double G, double B)> ambient, List<LightBasis> basis, List<int> idxList)
@@ -1298,6 +1304,9 @@ namespace JKDecompiler.Core
                     h[a] += p.Weight * gv[a] * dot[a];
                 }
             }
+            for (int a = 0; a < n; a++)
+                for (int b = a + 1; b < n; b++)
+                    G[b, a] = G[a, b];
             return (G, h);
         }
 
@@ -1318,8 +1327,12 @@ namespace JKDecompiler.Core
         public static double[] NnlsSolve(double[,] G, double[] h, double ridge = 0.0)
         {
             int n = h.Length;
-            // add ridge to the diagonal (copy — the caller's matrix may be reused)
-            for (int i = 0; i < n; i++) G[i, i] += ridge;
+            // work on a copy — the caller's matrix may be reused, and the ridge
+            // is added to the copy's diagonal only
+            var W = new double[n, n];
+            for (int i = 0; i < n; i++)
+                for (int j = 0; j < n; j++)
+                    W[i, j] = (i == j ? G[i, j] + ridge : G[i, j]);
 
             var s = new double[n];
             var inSet = new bool[n];
@@ -1331,7 +1344,7 @@ namespace JKDecompiler.Core
                 for (int i = 0; i < n; i++)
                 {
                     double acc = h[i];
-                    for (int j = 0; j < n; j++) acc -= G[i, j] * s[j];
+                    for (int j = 0; j < n; j++) acc -= W[i, j] * s[j];
                     r[i] = acc;
                 }
                 var grad = new double[n];
@@ -1339,7 +1352,7 @@ namespace JKDecompiler.Core
                 for (int j = 0; j < n; j++)
                 {
                     double acc = 0;
-                    for (int i = 0; i < n; i++) acc += G[i, j] * r[i];
+                    for (int i = 0; i < n; i++) acc += W[i, j] * r[i];
                     grad[j] = acc;
                     gnorm += acc * acc;
                 }
@@ -1365,7 +1378,7 @@ namespace JKDecompiler.Core
                     for (int i = 0; i < m; i++)
                     {
                         b[i] = h[idx[i]];
-                        for (int j = 0; j < m; j++) A[i, j] = G[idx[i], idx[j]];
+                        for (int j = 0; j < m; j++) A[i, j] = W[idx[i], idx[j]];
                     }
                     double[] sp = SolveLinear(A, b, m);
                     if (sp == null)
@@ -1517,7 +1530,7 @@ namespace JKDecompiler.Core
                 rows[i] = new double[n + 1];
                 for (int j = 0; j < n; j++) rows[i][j] = G[i, j];
                 rows[i][n] = h[i];
-                if (i < n - 1) rows[i][i] += ridge;
+                rows[i][i] += ridge;
             }
             // gaussian elimination with partial pivoting, element-wise swaps
             for (int col = 0; col < n; col++)
@@ -2756,8 +2769,22 @@ namespace JKDecompiler.Core
                         double dx = p.X - pos.X, dy = p.Y - pos.Y, dz = p.Z - pos.Z;
                         double dist = Math.Sqrt(dx * dx + dy * dy + dz * dz);
                         double d0 = Math.Sqrt(Math.Pow(p.X - x0.X, 2) + Math.Pow(p.Y - x0.Y, 2) + Math.Pow(p.Z - x0.Z, 2));
-                        // q3map2 point lights decay inverse-square (d0/dist)² — match the real bake
-                        double ar = (d0 * d0) / Math.Max(1e-9, dist * dist);
+                        // This q3map2 fork bakes point lights with the JKA
+                        // QUADRATIC falloff (1-(d/r)², hard cutoff at r) — NOT
+                        // the original q3map2 inverse-square. Verified on
+                        // fitrun30_s001's single (sampdbg_000.json, 3,332
+                        // field points of sw_01): binned profile is flat in
+                        // the interior (~180/ch) and falls to 0 at the 900u
+                        // seed radius; an inverse-square fit returns I≈0
+                        // (rms 148 vs 37 for the quadratic). The radius is
+                        // the REFINED one (RefineRadii runs before this);
+                        // the floor tames points just outside the old pool
+                        // edge (true ratio is unbounded there; the final
+                        // compile with rollback is the arbiter).
+                        double rad = Math.Max(1.0, light.Radius);
+                        double attNew = Math.Max(0.0, 1.0 - (dist * dist) / (rad * rad));
+                        double attOld = Math.Max(0.0, 1.0 - (d0 * d0) / (rad * rad));
+                        double ar = attNew / Math.Max(0.1, attOld);
                         // angular factor ratio
                         double dotNew = (dx * p.NX + dy * p.NY + dz * p.NZ);
                         if (dist > 1e-6) dotNew /= dist;

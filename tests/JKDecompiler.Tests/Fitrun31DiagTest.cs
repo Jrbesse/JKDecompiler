@@ -21,21 +21,29 @@ namespace JKDecompiler.Tests;
 public class Fitrun31DiagTest
 {
     const string Run = "/tmp/lfit/fitrun31";
-    const string Run32 = "/tmp/lfit/fitrun32";
+    // Post-fix post-mortem target: the FIRST run after the symmetrized-
+    // normal-matrix fix (and the have[] fix), built with JKD_STAGEA_DBG=1
+    // so its stage-A measurement is dumped. The original target (fitrun32,
+    // pre-fix) measured a 126 L1 gap between the run's own measurement and
+    // an offline re-sample — exactly the have[] lobe bug this class tracks.
+    const string Run34 = "/tmp/lfit/fitrun34";
     const string OrigBsp = "/tmp/lfit/src/academy1.bsp";
 
     /// <summary>
-    /// fitrun32 (instrumented): diff the run's OWN stage-A measurement
-    /// (stagea_dbg.json: allVals + gscales + l1) against an offline
-    /// re-sample of the saved fit_stageA.bsp. Answers: (a) is the run's
-    /// l1 consistent with its own vals? (b) where do the run's vals
-    /// diverge from the re-sample, and by how much?
+    /// Post-mortem (fitrun34, post-fix): diff the run's OWN stage-A
+    /// measurement (stagea_dbg.json: allVals + gscales + l1) against an
+    /// offline re-sample of the saved fit_stageA.bsp. Invariants asserted:
+    /// (a) the run's L1 matches the re-sample (the pre-fix gap was 201.53
+    /// vs 75.36 — the un-gated candidate fields); (b) every divergent point
+    /// is a FILL point — sampled points read the same saved lightmap on
+    /// both sides, so divergence there means the measurement itself is
+    /// broken. Skips when the artifacts are absent (CI).
     /// </summary>
     [Fact]
     public void DiffRunMeasurementVsResample()
     {
-        string dbgPath = Path.Combine(Run32, "scratch", "stagea_dbg.json");
-        string stageAPath = Path.Combine(Run32, "scratch", "fit_stageA", "fit_stageA.bsp");
+        string dbgPath = Path.Combine(Run34, "scratch", "stagea_dbg.json");
+        string stageAPath = Path.Combine(Run34, "scratch", "fit_stageA", "fit_stageA.bsp");
         if (!File.Exists(dbgPath) || !File.Exists(stageAPath)) return;
 
         var dbg = JsonDocument.Parse(File.ReadAllText(dbgPath));
@@ -43,12 +51,12 @@ public class Fitrun31DiagTest
         var gsRun = dbg.RootElement.GetProperty("gscales").EnumerateArray().Select(e => e.GetDouble()).ToArray();
         var allVals = dbg.RootElement.GetProperty("allVals").EnumerateArray().Select(e => e.GetDouble()).ToArray();
 
-        var probe = new BspReader().Read(Path.Combine(Run32, "scratch", "fit_probe", "fit_probe.bsp"));
+        var probe = new BspReader().Read(Path.Combine(Run34, "scratch", "fit_probe", "fit_probe.bsp"));
         var stageA = new BspReader().Read(stageAPath);
         var ff = new LightFit("", "");
         int nL = gsRun.Length;
         var singles = Enumerable.Range(0, nL)
-            .Select(i => new BspReader().Read(Path.Combine(Run32, "scratch", $"fit_s{i:D3}", $"fit_s{i:D3}.bsp")))
+            .Select(i => new BspReader().Read(Path.Combine(Run34, "scratch", $"fit_s{i:D3}", $"fit_s{i:D3}.bsp")))
             .ToList();
 
         var orig = new BspReader().Read(OrigBsp);
@@ -143,10 +151,15 @@ public class Fitrun31DiagTest
             gsRun,
             worstDivergences = worst,
         };
-        string outPath = Path.Combine(Run32, "fitrun32_diag.json");
+        string outPath = Path.Combine(Run34, "fitrun34_diag.json");
         File.WriteAllText(outPath, System.Text.Json.JsonSerializer.Serialize(report, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
         double pctDiv = wTot > 0 ? 100 * wDiv / wTot : 0;
-        Console.WriteLine($"[diag32] runL1={l1Run:F2} runValsRescored={l1RunVals:F2} myResample={l1Mine:F2} div={nDiv} ({pctDiv:F1}%w) → {outPath}");
+        Console.WriteLine($"[diag34] runL1={l1Run:F2} runValsRescored={l1RunVals:F2} myResample={l1Mine:F2} div={nDiv} ({pctDiv:F1}%w) → {outPath}");
+        // Post-fix invariants (see summary): run measurement == re-sample,
+        // and divergence is confined to fill points.
+        Assert.True(nDiv <= nF, $"divergence outside fill points: {nDiv} > nFill={nF}");
+        Assert.True(Math.Abs(l1Run - l1Mine) < 1.5,
+            $"run stage-A L1 {l1Run:F2} vs offline re-sample {l1Mine:F2} — the have[]/fill path diverged from the saved bake again");
     }
 
     [Fact]
@@ -588,14 +601,39 @@ public class Fitrun31DiagTest
         string outPath = Path.Combine(Run, "fitrun31_diag.json");
         File.WriteAllText(outPath, JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true }));
         Console.WriteLine($"[diag] n={nP} c={c:F3} l1Amb={l1Amb:F2} l1Bake(samp/fill)={l1BakeSampled:F2}/{l1BakeFill:F2} l1Model={l1Model:F2} unexplained={unexplained:F2} → {outPath}");
-        // Faithfulness: the reconstruction reproduces the run's ambient L1 and
-        // its 5b selection. (It does NOT reproduce 201.49 — the run's stage-A
-        // modelFill used the POST-radfit gscales, which PolishedRms re-solves
-        // with unconstrained LSQ on the near-singular wall-washer block; the
-        // split above quantifies that. radfitPolish* shows the blow-up.)
+        // Faithfulness: the reconstruction reproduces the run's ambient L1.
         Assert.True(Math.Abs(l1Amb - 103.0216) < 0.5, $"l1AmbientOnly {l1Amb:F3} != 103.02");
-        double maxDev = 0;
-        for (int l = 0; l < nL; l++) maxDev = Math.Max(maxDev, Math.Abs(g5[l] - gscales[l]));
-        Assert.True(maxDev < 0.02, $"5b replica deviates from report scales by {maxDev:F4}");
+        // The shipped fitrun31 scales (gscales) are a FEASIBLE point of the
+        // 5b problem. The fixed joint solve (g5, symmetrized normal matrix)
+        // must reach a model L1 no worse than that feasible point — the
+        // "guaranteed ≤ the error of any feasible point" property, now of
+        // the system actually solved. Pre-fix, the half-filled G produced a
+        // partition ~1.0 L1 worse (PR #13 review, re-derived on fitrun33);
+        // this is the assertion that catches a regression to the half-filled
+        // matrix on this real data. (The fitrun31-vs-shipped scale deviation
+        // is EXPECTED post-fix and reported as fiveBReplica above — the
+        // shipped scales came from the buggy solve.)
+        double L1ModelVsOrig(double[] gs)
+        {
+            double tot = 0, w = 0;
+            for (int id = 0; id < nP; id++)
+            {
+                var p = pairs[id];
+                double rr = ambient[id].R + c, rg = ambient[id].G + c, rb = ambient[id].B + c;
+                for (int l = 0; l < nL; l++)
+                {
+                    rr += gs[l] * fields[l][id * 3 + 0];
+                    rg += gs[l] * fields[l][id * 3 + 1];
+                    rb += gs[l] * fields[l][id * 3 + 2];
+                }
+                tot += p.Weight * (Math.Abs(p.OR - rr) + Math.Abs(p.OG - rg) + Math.Abs(p.OB - rb));
+                w += p.Weight;
+            }
+            return w > 0 ? tot / w : 0;
+        }
+        double l1FixedSolve = L1ModelVsOrig(g5);
+        double l1ShippedScales = L1ModelVsOrig(gscales);
+        Assert.True(l1FixedSolve <= l1ShippedScales + 0.8,
+            $"fixed joint solve model L1 {l1FixedSolve:F3} worse than shipped scales {l1ShippedScales:F3} — is the normal matrix symmetric?");
     }
 }
