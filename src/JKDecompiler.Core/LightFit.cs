@@ -192,7 +192,7 @@ namespace JKDecompiler.Core
         /// Build lit-face sample data from a BSP: per-face world verts, UVs,
         /// world→UV affine (planar faces), 2D hull + local frame, interior grid.
         /// </summary>
-        static List<SampleFace> BuildSampleFaces(BspData d)
+        internal static List<SampleFace> BuildSampleFaces(BspData d)
         {
             var list = new List<SampleFace>();
             for (int i = 0; i < d.Faces.Count; i++)
@@ -2336,7 +2336,14 @@ namespace JKDecompiler.Core
                 var sel = Enumerable.Range(0, nL).Where(l => lights[l].Kept && gscales[l] > 0).ToList();
                 RefineRadii(pairs, singleFields, basis, lights, sel, ambientExt, gscales, baseText, dummyText, scratchRoot, res);
                 for (int l = 0; l < nL; l++)
+                {
+                    // The re-polished scale must reach the bakes: EntityText
+                    // reads lights[l].Scale, and the stage A / final compiles
+                    // (below) bake from it — leaving it at the pre-refinement
+                    // value would bake a scale the model no longer carries.
                     scales[l] = new[] { gscales[l] * basis[l].VR, gscales[l] * basis[l].VG, gscales[l] * basis[l].VB };
+                    lights[l].Scale = scales[l];
+                }
             }
 
             // 7b. stage A compile: all surviving lights, seed positions, fitted scales
@@ -2365,6 +2372,59 @@ namespace JKDecompiler.Core
                         return (r, g, b);
                     });
                 res.ErrorStageA = L1Of(pairs, vals);
+                if (Environment.GetEnvironmentVariable("JKD_STAGEA_DBG") == "1")
+                {
+                    // Post-mortem hook: the stage-A gate L1 has been observed
+                    // disagreeing with an offline re-sample of the same saved
+                    // BSP (fitrun31: 201.49 in-run vs 75.32 re-sampled). Dump
+                    // the run's OWN measurement inputs so the two can be
+                    // diffed point-for-point without another 20-min compile.
+                    try
+                    {
+                        var big = new List<object>();
+                        var allVals = new double[pairs.Count * 3];
+                        for (int id = 0; id < pairs.Count; id++)
+                        {
+                            var p = pairs[id];
+                            allVals[id * 3 + 0] = Math.Round(vals[id].R, 2);
+                            allVals[id * 3 + 1] = Math.Round(vals[id].G, 2);
+                            allVals[id * 3 + 2] = Math.Round(vals[id].B, 2);
+                            double d = Math.Abs(p.OR - vals[id].R) + Math.Abs(p.OG - vals[id].G) + Math.Abs(p.OB - vals[id].B);
+                            if (d > 40) big.Add(new { id, w = p.Weight, o = new[] { p.OR, p.OG, p.OB }, v = new[] { vals[id].R, vals[id].G, vals[id].B }, d });
+                        }
+                        // per-light light energy the fill formula carries,
+                        // summed over all points (sampled points are
+                        // overwritten by the lightmap in vals; the totals are
+                        // still the right scale-check for the fill term)
+                        var fillLit = new double[nL];
+                        for (int id = 0; id < pairs.Count; id++)
+                        {
+                            var p = pairs[id];
+                            for (int l = 0; l < nL; l++)
+                                if (gscales[l] != 0)
+                                    fillLit[l] += p.Weight * gscales[l] * (singleFields[l][id].R + singleFields[l][id].G + singleFields[l][id].B) / 3.0;
+                        }
+                        var dbg = new
+                        {
+                            l1 = res.ErrorStageA,
+                            ambientOnly = res.ErrorAmbientOnly,
+                            nPairs = pairs.Count,
+                            gscales = gscales.Select(v => Math.Round(v, 5)).ToArray(),
+                            survivorIndices = Enumerable.Range(0, lights.Count).Where(i => survivorsA.Contains(lights[i])).ToArray(),
+                            bigDeltaCount = big.Count,
+                            bigDeltas = big.Take(80),
+                            fillEnergyPerLight = fillLit.Select(v => Math.Round(v, 1)).ToArray(),
+                            allVals,
+                        };
+                        File.WriteAllText(Path.Combine(scratchRoot, "stagea_dbg.json"),
+                            System.Text.Json.JsonSerializer.Serialize(dbg, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+                        Console.Error.WriteLine($"[stageadbg] l1={res.ErrorStageA:F3} bigDelta(>40/3ch)={big.Count} → stagea_dbg.json");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine("[stageadbg] dump failed: " + ex);
+                    }
+                }
             }
             else
             {
