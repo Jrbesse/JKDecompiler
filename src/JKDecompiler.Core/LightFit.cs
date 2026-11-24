@@ -649,56 +649,111 @@ namespace JKDecompiler.Core
             int OfFace, int OfBlock, double Ou, double Ov);
 
         /// <summary>
-        /// Probe-driven sample points: points live on PROBE faces, with the
-        /// probe's (face, block, UV) stored per point. q3map2 jitters lightmap
-        /// UVs by up to ~1 px between independently compiled BSPs, so the
-        /// stored probe UVs are only used to read the probe itself; candidates
-        /// are sampled through their own world→UV affine (SampleCandidate) —
-        /// their lightmap packing differs from the probe's even at equal light
-        /// counts, so the probe's UVs cannot be reused.
-        /// Points whose original face can't be located are skipped (no target).
+        /// Dense original-driven sample points: every lightmap texel of every
+        /// ORIGINAL face is a sample point — the original bake's own resolution
+        /// (~150k points on academy1). The old probe-driven set (~5.9k points
+        /// on probe faces, deduped per probe texel) was a byproduct of the
+        /// no-light probe's lightmap packing, which assigns tiny UV areas to
+        /// faces; it resolved only ~4% of the original texels, so individual
+        /// point-light pools were worth &lt;0.3 L1 on it and the drop stage
+        /// discarded even provably-correct seeds (fitrun11/13: ΔE≈0 for every
+        /// light while face-level joins showed corr 0.85+).
+        /// Targets are the original texels exactly (direct block read); ambient
+        /// is the probe field at the same world point (the probe's dummy light
+        /// spans the map, so every face has a probe lightmap). Candidates are
+        /// still sampled through their own world→UV affine (SampleCandidate).
         /// </summary>
         internal (List<SamplePair> Pairs, int Unmatched, int Matched)
-            BuildProbePairs(BspData orig, List<SampleFace> origFaces, BspData probe, List<SampleFace> probeFaces)
+            BuildOrigPairs(BspData orig, List<SampleFace> origFaces, BspData probe, List<SampleFace> probeFaces)
         {
-            var idx = new CandidateIndex(origFaces);
+            var pidx = new CandidateIndex(probeFaces);
             var pairs = new List<SamplePair>();
             int matched = 0, unmatched = 0;
-            foreach (var pf in probeFaces)
+            var noAmb = new List<int>();   // pair indices whose probe face wasn't found
+            foreach (var of in origFaces)
             {
-                var pts = FaceSamplePoints(pf);
-                int w = (int)Math.Max(1, Math.Round(pf.Area / pts.Count));
-                // One measurement per lightmap texel: q3map2 gives sub-texel
-                // ("solid") faces a single center UV, so N grid points on such
-                // a face would be N copies of one texel and overweight it in
-                // the least squares. Accumulate area weight per unique texel.
-                var byTexel = new Dictionary<long, (SamplePoint P, int W, double U, double V)>();
-                foreach (var p in pts)
+                if (of.Verts.Length < 3 || of.VertexUvs.Length != of.Verts.Length) continue;
+                // Affine (u,v) = A·(1,px,py) in the face's 2D frame
+                // (world = FrameOrigin + FrameU·px + FrameV·py), least-squares
+                // over the vertices — UVs are planar on a face.
+                double S00 = 0, S01 = 0, S02 = 0, S11 = 0, S12 = 0, S22 = 0;
+                double bu0 = 0, bu1 = 0, bu2 = 0, bv0 = 0, bv1 = 0, bv2 = 0;
+                for (int i = 0; i < of.Verts.Length; i++)
                 {
-                    var (pu, pv) = WorldToUv(pf, p);
-                    int tx = (int)(Math.Clamp(pu, 0, 1) * 127);
-                    int ty = (int)(Math.Clamp(pv, 0, 1) * 127);
-                    long key = ((long)tx << 7) | ty;
-                    if (byTexel.TryGetValue(key, out var ex))
-                        ex.W += w;
-                    else
-                        byTexel[key] = (p, w, pu, pv);
+                    var vrt = of.Verts[i];
+                    double dx = vrt.X - of.FrameOrigin.X, dy = vrt.Y - of.FrameOrigin.Y, dz = vrt.Z - of.FrameOrigin.Z;
+                    double px = dx * of.FrameU.X + dy * of.FrameU.Y + dz * of.FrameU.Z;
+                    double py = dx * of.FrameV.X + dy * of.FrameV.Y + dz * of.FrameV.Z;
+                    S00 += 1; S01 += px; S02 += py; S11 += px * px; S12 += px * py; S22 += py * py;
+                    double uu = of.VertexUvs[i].U, vv = of.VertexUvs[i].V;
+                    bu0 += uu; bu1 += uu * px; bu2 += uu * py;
+                    bv0 += vv; bv1 += vv * px; bv2 += vv * py;
                 }
-                foreach (var (p, ww, pu, pv) in byTexel.Values)
+                double[,] A = { { S00, S01, S02 }, { S01, S11, S12 }, { S02, S12, S22 } };
+                double ridge = 1e-9 * Math.Max(1.0, (A[0, 0] + A[1, 1] + A[2, 2]) / 3);
+                var ua = SolveLeastSquares(A, 3, new[] { bu0, bu1, bu2 }, ridge);
+                var va = SolveLeastSquares(A, 3, new[] { bv0, bv1, bv2 }, ridge);
+                double det = ua[1] * va[2] - ua[2] * va[1];
+                if (Math.Abs(det) < 1e-12) continue;   // degenerate UV region
+                int x0 = (int)Math.Round(of.UMin * 127), x1 = (int)Math.Round(of.UMax * 127);
+                int y0 = (int)Math.Round(of.VMin * 127), y1 = (int)Math.Round(of.VMax * 127);
+                if (x0 > x1) { int t = x0; x0 = x1; x1 = t; }
+                if (y0 > y1) { int t = y0; y0 = y1; y1 = t; }
+                int nx = x1 - x0 + 1, ny = y1 - y0 + 1;
+                if (nx < 2 || ny < 2) continue;         // solid/sub-texel face
+                double w = of.Area / (nx * ny);         // area weight per texel
+                var block = orig.Lightmaps[of.Block].Data;
+                for (int x = x0; x <= x1; x++)
                 {
-                    var pval = SampleFaceValue(probe.Lightmaps[pf.Block].Data, pf, pu, pv);
-                    var of = idx.Find(p.X, p.Y, p.Z);
-                    if (of == null)
+                    double u = x / 127.0;
+                    for (int y = y0; y <= y1; y++)
                     {
-                        unmatched++;
-                        continue;
+                        double v = y / 127.0;
+                        double du = u - ua[0], dv = v - va[0];
+                        double px = (du * va[2] - ua[2] * dv) / det;
+                        double py = (ua[1] * dv - du * va[1]) / det;
+                        if (!PointInHull(of.Hull2D, px, py)) continue;
+                        double wx = of.FrameOrigin.X + of.FrameU.X * px + of.FrameV.X * py;
+                        double wy = of.FrameOrigin.Y + of.FrameU.Y * px + of.FrameV.Y * py;
+                        double wz = of.FrameOrigin.Z + of.FrameU.Z * px + of.FrameV.Z * py;
+                        int o3 = (y * 128 + x) * 3;
+                        byte or_ = block[o3], og = block[o3 + 1], ob = block[o3 + 2];
+                        var pf = pidx.Find(wx, wy, wz);
+                        int pface = -1, pblock = -1; double pu = 0, pv = 0;
+                        byte pr = 0, pg = 0, pb = 0;
+                        if (pf != null)
+                        {
+                            pface = pf.FaceIndex; pblock = pf.Block;
+                            (pu, pv) = WorldToUv(pf, new SamplePoint { X = wx, Y = wy, Z = wz });
+                            var pval = SampleFaceValue(probe.Lightmaps[pf.Block].Data, pf, pu, pv);
+                            pr = pval.R; pg = pval.G; pb = pval.B;
+                            matched++;
+                        }
+                        else
+                        {
+                            unmatched++;
+                            noAmb.Add(pairs.Count);
+                        }
+                        pairs.Add(new SamplePair(wx, wy, wz, w, or_, og, ob, pr, pg, pb,
+                            of.Normal.X, of.Normal.Y, of.Normal.Z, pface, pblock, pu, pv,
+                            of.FaceIndex, of.Block, u, v));
                     }
-                    matched++;
-                    var (ou, ov) = WorldToUv(of, p);
-                    var oval = SampleFaceValue(orig.Lightmaps[of.Block].Data, of, ou, ov);
-                    pairs.Add(new SamplePair(p.X, p.Y, p.Z, ww, oval.R, oval.G, oval.B, pval.R, pval.G, pval.B,
-                        of.Normal.X, of.Normal.Y, of.Normal.Z, pf.FaceIndex, pf.Block, pu, pv,
-                        of.FaceIndex, of.Block, ou, ov));
+                }
+            }
+            // Points whose probe face wasn't located (UV jitter at edges):
+            // fill with the mean matched ambient so the target still counts.
+            if (noAmb.Count > 0)
+            {
+                double ar = 0, ag = 0, ab = 0; int am = 0;
+                foreach (var p in pairs)
+                {
+                    if (p.PFace < 0) continue;
+                    ar += p.CR; ag += p.CG; ab += p.CB; am++;
+                }
+                if (am > 0)
+                {
+                    byte fr = (byte)(ar / am), fg = (byte)(ag / am), fb = (byte)(ab / am);
+                    foreach (int i in noAmb) pairs[i] = pairs[i] with { CR = fr, CG = fg, CB = fb };
                 }
             }
             return (pairs, unmatched, matched);
@@ -1454,12 +1509,13 @@ namespace JKDecompiler.Core
             var center = new Vector3((float)((vminx + vmaxx) / 2), (float)((vminy + vmaxy) / 2), (float)((vminz + vmaxz) / 2));
             // The dummy's radius must SPAN the map: q3map2 only assigns
             // lightmaps to faces touched by a light's envelope, and
-            // BuildProbePairs is probe-driven (sample points live on probe
-            // texels). At the old fixed 1024u the probe covered only the
-            // central 10 of academy1's 24 blocks, so every seed pool outside
-            // that sphere had zero field on the sample set and the fit could
-            // never see it (measured: 6/20 single fields byte-identical dead
-            // while their compiles were healthy 10-block bakes).
+            // BuildOrigPairs reads the ambient from the probe at every
+            // original texel's world point. At the old fixed 1024u the probe
+            // covered only the central 10 of academy1's 24 blocks, so every
+            // seed pool outside that sphere had zero field on the sample set
+            // and the fit could never see it (measured: 6/20 single fields
+            // byte-identical dead while their compiles were healthy 10-block
+            // bakes).
             double dummyR = Math.Sqrt(Math.Pow((vmaxx - vminx) / 2, 2)
                 + Math.Pow((vmaxy - vminy) / 2, 2)
                 + Math.Pow((vmaxz - vminz) / 2, 2)) * 1.05;
@@ -1488,7 +1544,7 @@ namespace JKDecompiler.Core
                 return res;
             }
             var probeFaces = BuildSampleFaces(probeBsp);
-            var (pairs, unmatched, matched) = BuildProbePairs(origBsp, origFaces, probeBsp, probeFaces);
+            var (pairs, unmatched, matched) = BuildOrigPairs(origBsp, origFaces, probeBsp, probeFaces);
             res.UnmatchedPoints = unmatched;
             res.MatchedPoints = matched;
             if (pairs.Count == 0)
