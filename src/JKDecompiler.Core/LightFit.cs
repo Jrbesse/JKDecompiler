@@ -83,9 +83,10 @@ namespace JKDecompiler.Core
         public double ErrorAmbientOnly;  // L1 area-weighted error of the no-light compile
         public double ErrorStageA;       // after the joint linear fit, seed positions
         public double ErrorFinal;        // after position refinement (+ final compile)
-        public double SkyGain;           // fitted gain on the sky basis (spatial wash or 0/1 indicator)
-        public double SkyOffset;         // fitted per-channel constant sky/ambient offset
-        public bool SkySpatial;          // the sky fit used the spatial A/B wash basis (true) or the 0/1 indicator (false)
+        public double SkyGain;           // diagnostic: [wash, const] fit gain on the strong-wash points (spatial) or indicator gain (fallback)
+        public double SkyOffset;         // diagnostic: the constant of the same fit, per channel
+        public bool SkySpatial;          // the sky fit used the spatial A/B wash (true) or the 0/1 indicator (false)
+        public double SkyModelOffset;    // the per-channel offset the light fit's ambient model actually carries (spatial: non-pool mean of orig−probe; fallback: the fit offset)
         public bool PositionsRolledBack;
         public List<FitLight> Lights = new();
         public int CompilesRun;
@@ -1072,142 +1073,188 @@ namespace JKDecompiler.Core
         }
 
         /// <summary>
-        /// Fit the frozen sky correction [sky basis, constant] and return the
-        /// per-point extended ambient that the light fit targets against
-        /// (skyFitAmbient + gain·skyBasis + offset, per channel).
+        /// Fit the frozen sky correction and return the per-point extended
+        /// ambient that the light fit targets against.
         ///
         /// SPATIAL path (ambientNoSky supplied — the no-sky A/B compile of 3b
-        /// succeeded): the sky basis is the MEASURED wash probe − noSky, a
-        /// spatial field, and the target is orig − noSky on ALL points. The
-        /// fitted gain scales the baked wash up to the original's magnitude;
-        /// calibrate the overlay's q3map_skyLight value to 150 × gain and the
-        /// gain lands near 1. No bright-point mask here: with a spatial basis
-        /// the bright points ARE the wash — exactly where the gain is learned
-        /// (the mask below exists only to protect a FLAT indicator's constant
-        /// term, and fitrun27's mask excluded precisely the wash points,
-        /// pinning the gain at 0.0000 with the wash baked).
+        /// succeeded):
+        ///   MODEL (what the light fit sees): ambientExt = probe + c, where
+        ///   c = [const] fit against (orig − probe) on the non-pool points.
+        ///   The model carries the wash exactly as BAKED (gain 1) — the
+        ///   stage-A bake is probe + fitted lights, so the model must be too.
+        ///   A scaled wash in the model (the earlier gain·wash design) breaks
+        ///   bake-model consistency: fitrun28's gain 6.46 made the model
+        ///   overshoot the baked walls by ~380, the non-negative light fit
+        ///   couldn't subtract it, and stage-A came out 40 worse than ambient.
+        ///   DIAGNOSTIC (reported gain/offset): [wash, const] LSQ against
+        ///   (orig − noSky) on the STRONG-wash non-pool points (max wash
+        ///   channel &gt; 10 — the outer walls, where the wash dominates and
+        ///   (orig−noSky)/wash is the value scale). Weak-wash interior points
+        ///   are excluded: their (orig−noSky) is radiosity-delta + light
+        ///   spillover over a near-zero wash, so their ratios explode and
+        ///   dominate the slope (fitrun28b: pool-masked full-set fit gave
+        ///   gain 30.6 for exactly this reason). The gain tells the user the
+        ///   --sky-value that would land the baked wash at the original's
+        ///   magnitude (value × gain ≈ 1 → re-bake at 150 × gain).
         ///
-        /// FALLBACK path (no sky in the map, or the A/B failed): 0/1
-        /// sky-presence indicator (max-channel ≥ 40 of the probe ambient) +
-        /// bright-point mask (orig − ambient &gt; 8/ch in any channel, or a
-        /// light field &gt; 8 at the point) — the constant absorbs whatever
-        /// residual the LSQ can't fit elsewhere (fitrun14: offset 34.19/ch),
-        /// and the lights own the bright regions, so [sky, constant] must
-        /// only see non-bright points.
+        /// MASK (both paths): points inside a fitted light field (|field|
+        /// &gt; 8) are excluded — the lights own those points, and on
+        /// academy1 the wall-washer pools sit on the same outer walls as the
+        /// sky wash, so unmasked the light energy in the target contaminates
+        /// the sky coefficients (fitrun28: unmasked gain 6.46 + the constant
+        /// absorbing the pool mean +32.5/ch).
         ///
-        /// The mask mutates pair weights during the fallback fit and restores
-        /// them before returning.
+        /// FALLBACK path (no sky / A/B failed): 0/1 sky-presence indicator
+        /// (max-channel ≥ 40 of the probe) + the BRIGHT-POINT clause
+        /// (orig − probe &gt; 8/ch) on top of the pool mask; model = probe +
+        /// gain·indicator + offset (the old behavior — with no sky in the
+        /// map the bake has no wash either, so this is bake-consistent).
+        ///
+        /// The masks mutate pair weights during the fits and restore them
+        /// before returning.
         /// </summary>
-        internal static (double Gain, double Offset, bool Spatial, List<(double R, double G, double B)> AmbientExt)
+        internal static (double Gain, double Offset, bool Spatial, double ModelOffset, List<(double R, double G, double B)> AmbientExt)
             FitSkyCorrection(List<SamplePair> pairs,
                 List<(double R, double G, double B)> ambient,
                 List<(double R, double G, double B)>? ambientNoSky,
                 List<List<(double R, double G, double B)>> singleFields)
         {
             bool spatial = ambientNoSky != null;
-            var skyField = new List<(double R, double G, double B)>(pairs.Count);
+            var poolW = new List<(int Id, double W)>();
+            for (int id = 0; id < pairs.Count; id++)
+            {
+                bool inPool = false;
+                for (int l = 0; l < singleFields.Count && !inPool; l++)
+                {
+                    var f = singleFields[l][id];
+                    inPool = Math.Max(Math.Abs(f.R), Math.Max(Math.Abs(f.G), Math.Abs(f.B))) > 8.0;
+                }
+                if (inPool)
+                {
+                    poolW.Add((id, pairs[id].Weight));
+                    pairs[id] = pairs[id] with { Weight = 0 };
+                }
+            }
+            var ambientExt = new List<(double R, double G, double B)>(pairs.Count);
+            double gain, offset, modelOffset;
             if (spatial)
             {
+                // MODEL offset c = [const] against (orig − probe), non-pool
+                // points. One scalar across channels (the const basis is
+                // v = (1,1,1), same convention as the 2-basis fit).
+                double wsum = 0, tR = 0, tG = 0, tB = 0;
                 for (int id = 0; id < pairs.Count; id++)
-                    skyField.Add((ambient[id].R - ambientNoSky![id].R,
-                                  ambient[id].G - ambientNoSky![id].G,
-                                  ambient[id].B - ambientNoSky![id].B));
+                {
+                    var p = pairs[id];
+                    if (p.Weight == 0) continue;
+                    var a = ambient[id];
+                    wsum += p.Weight;
+                    tR += p.Weight * (p.OR - a.R);
+                    tG += p.Weight * (p.OG - a.G);
+                    tB += p.Weight * (p.OB - a.B);
+                }
+                double c = wsum > 0 ? (tR + tG + tB) / (3.0 * wsum) : 0.0;
+                modelOffset = c;
+                for (int id = 0; id < pairs.Count; id++)
+                {
+                    var a = ambient[id];
+                    ambientExt.Add((a.R + c, a.G + c, a.B + c));
+                }
+                // DIAGNOSTIC: [wash, const] against (orig − noSky) on the
+                // strong-wash non-pool points.
+                var skyField = new List<(double R, double G, double B)>(pairs.Count);
+                var weakW = new List<(int Id, double W)>();
+                int strong = 0;
+                for (int id = 0; id < pairs.Count; id++)
+                {
+                    var a = ambient[id];
+                    var ns = ambientNoSky![id];
+                    skyField.Add((a.R - ns.R, a.G - ns.G, a.B - ns.B));
+                    if (pairs[id].Weight == 0) continue;
+                    double wm = Math.Max(a.R - ns.R, Math.Max(a.G - ns.G, a.B - ns.B));
+                    if (wm > 10.0) strong++;
+                    else
+                    {
+                        weakW.Add((id, pairs[id].Weight));
+                        pairs[id] = pairs[id] with { Weight = 0 };
+                    }
+                }
+                var constField = new List<(double R, double G, double B)>(pairs.Count);
+                for (int id = 0; id < pairs.Count; id++) constField.Add((1.0, 1.0, 1.0));
+                var corrBasis = new List<LightBasis> { BuildBasis(skyField), BuildBasis(constField) };
+                var (Gc, hc) = BuildGh1D(pairs, ambientNoSky!, corrBasis, new List<int> { 0, 1 });
+                Gc[1, 0] = Gc[0, 1];
+                if (strong == 0)
+                {
+                    // degenerate: no strong-wash points (the sky light
+                    // failed to fire) — gain 0, the model offset stands.
+                    gain = 0.0;
+                    offset = c;
+                }
+                else
+                {
+                    double[] xc = SolveLeastSquares(Gc, 2, hc, 1e-9 * Math.Max(1.0, (Gc[0, 0] + Gc[1, 1]) / 2));
+                    gain = xc[0];
+                    offset = xc[1];
+                }
+                foreach (var (id, w) in weakW) pairs[id] = pairs[id] with { Weight = w };
+                if (Environment.GetEnvironmentVariable("JKD_SKYDBG") == "1")
+                {
+                    double maskW = poolW.Sum(t => t.W);
+                    double totW = pairs.Sum(p => p.Weight) + maskW;
+                    Console.Error.WriteLine($"[skydbg] spatial mask: {poolW.Count} pool pts maskW={maskW:F0} totW={totW:F0} | strongWash={strong}");
+                    Console.Error.WriteLine($"[skydbg] model: c={c:F3}/ch (non-pool mean of orig−probe)");
+                    Console.Error.WriteLine($"[skydbg] diagnostic fit (strong-wash ∩ non-pool): G00={Gc[0, 0]:F0} G01={Gc[0, 1]:F0} G11={Gc[1, 1]:F0} h0={hc[0]:F0} h1={hc[1]:F0} → gain={gain:F4} offset={offset:F3}");
+                    Console.Error.WriteLine($"[skydbg] L1Of(pairs, probe) = {L1Of(pairs, ambient):F4} | L1Of(pairs, noSky) = {L1Of(pairs, ambientNoSky!):F4}  (n={pairs.Count})");
+                }
             }
             else
             {
+                // FALLBACK: 0/1 sky-presence indicator + bright-point clause.
+                var skyField = new List<(double R, double G, double B)>(pairs.Count);
                 for (int id = 0; id < pairs.Count; id++)
                 {
                     var a = ambient[id];
                     double s = Math.Max(a.R, Math.Max(a.G, a.B));
-                    double c = s >= 40.0 ? 1.0 : 0.0;   // sky visible
-                    skyField.Add((c, c, c));
+                    double q = s >= 40.0 ? 1.0 : 0.0;   // sky visible
+                    skyField.Add((q, q, q));
                 }
-            }
-            var constField = new List<(double R, double G, double B)>(pairs.Count);
-            for (int id = 0; id < pairs.Count; id++) constField.Add((1.0, 1.0, 1.0));
-            var corrBasis = new List<LightBasis> { BuildBasis(skyField), BuildBasis(constField) };
-            // target ambient: the no-sky bake for the spatial fit (the gain
-            // rescales the wash itself), the probe for the fallback.
-            var skyFitAmbient = spatial ? ambientNoSky! : ambient;
-            var poolW = new List<(int Id, double W)>();
-            if (!spatial)
-            {
+                var constField = new List<(double R, double G, double B)>(pairs.Count);
+                for (int id = 0; id < pairs.Count; id++) constField.Add((1.0, 1.0, 1.0));
+                var corrBasis = new List<LightBasis> { BuildBasis(skyField), BuildBasis(constField) };
+                var brightW = new List<(int Id, double W)>();
                 for (int id = 0; id < pairs.Count; id++)
                 {
-                    bool inPool = false;
-                    for (int l = 0; l < singleFields.Count && !inPool; l++)
+                    if (pairs[id].Weight == 0) continue;   // already pool-masked
+                    var p = pairs[id];
+                    var a = ambient[id];
+                    if ((p.OR - a.R) > 8.0 || (p.OG - a.G) > 8.0 || (p.OB - a.B) > 8.0)
                     {
-                        var f = singleFields[l][id];
-                        inPool = Math.Max(Math.Abs(f.R), Math.Max(Math.Abs(f.G), Math.Abs(f.B))) > 8.0;
-                    }
-                    if (!inPool)
-                    {
-                        var p = pairs[id];
-                        var a = ambient[id];
-                        inPool = (p.OR - a.R) > 8.0 || (p.OG - a.G) > 8.0 || (p.OB - a.B) > 8.0;
-                    }
-                    if (inPool)
-                    {
-                        poolW.Add((id, pairs[id].Weight));
+                        brightW.Add((id, pairs[id].Weight));
                         pairs[id] = pairs[id] with { Weight = 0 };
                     }
                 }
-            }
-            var (Gc, hc) = BuildGh1D(pairs, skyFitAmbient, corrBasis, new List<int> { 0, 1 });
-            // BuildGh1D accumulates only the upper triangle (Gc[1,0] stays 0);
-            // the normal equations are symmetric — restore the lower element
-            // before solving, or the 2×2 solve returns a wrong split of
-            // (gain, offset) whenever the two basis color directions differ
-            // (the spatial wash vs the neutral constant).
-            Gc[1, 0] = Gc[0, 1];
-            if (Environment.GetEnvironmentVariable("JKD_SKYDBG") == "1")
-            {
-                double maskW = poolW.Sum(t => t.W);
-                double totW = pairs.Sum(p => p.Weight) + maskW;
-                double nw = 0, nt = 0, nsw = 0, nst = 0, nnow = 0, nnot = 0;
+                var (Gc, hc) = BuildGh1D(pairs, ambient, corrBasis, new List<int> { 0, 1 });
+                Gc[1, 0] = Gc[0, 1];
+                double[] xc = SolveLeastSquares(Gc, 2, hc, 1e-9 * Math.Max(1.0, (Gc[0, 0] + Gc[1, 1]) / 2));
+                gain = xc[0];
+                offset = xc[1];
+                modelOffset = offset;
+                foreach (var (id, w) in brightW) pairs[id] = pairs[id] with { Weight = w };
                 for (int id = 0; id < pairs.Count; id++)
                 {
-                    if (poolW.Any(t => t.Id == id)) continue;
-                    var p = pairs[id];
-                    var a = skyFitAmbient[id];
-                    double t = ((double)(p.OR - (byte)a.R)
-                        + (p.OG - (byte)a.G)
-                        + (p.OB - (byte)a.B)) / 3.0;
-                    double am = Math.Max(a.R, Math.Max(a.G, a.B));
-                    nw += p.Weight; nt += p.Weight * t;
-                    if (am >= 40) { nsw += p.Weight; nst += p.Weight * t; }
-                    else { nnow += p.Weight; nnot += p.Weight * t; }
+                    var a = ambient[id];
+                    double cr = a.R, cg = a.G, cb = a.B;
+                    for (int m = 0; m < 2; m++)
+                    {
+                        double s = xc[m] * corrBasis[m].G[id];
+                        cr += s * corrBasis[m].VR; cg += s * corrBasis[m].VG; cb += s * corrBasis[m].VB;
+                    }
+                    ambientExt.Add((cr, cg, cb));
                 }
-                Console.Error.WriteLine($"[skydbg] {(spatial ? "spatial" : "indicator")} mask: {poolW.Count} pts maskW={maskW:F0} totW={totW:F0}");
-                Console.Error.WriteLine($"[skydbg] G00={Gc[0, 0]:F0} G01={Gc[0, 1]:F0} G11={Gc[1, 1]:F0} h0={hc[0]:F0} h1={hc[1]:F0}");
-                Console.Error.WriteLine($"[skydbg] nonpool: nW={nw:F0} meanT={nt / Math.Max(1, nw):F3} | sky nW={nsw:F0} meanT={nst / Math.Max(1, nsw):F3} | nonsky nW={nnow:F0} meanT={nnot / Math.Max(1, nnow):F3}");
-                double tR = 0, tG = 0, tB = 0;
-                for (int id = 0; id < pairs.Count; id++)
-                {
-                    var p = pairs[id];
-                    var a = skyFitAmbient[id];
-                    tR += p.Weight * Math.Abs(p.OR - a.R);
-                    tG += p.Weight * Math.Abs(p.OG - a.G);
-                    tB += p.Weight * Math.Abs(p.OB - a.B);
-                }
-                Console.Error.WriteLine($"[skydbg] L1Of(pairs, skyFitAmbient) = {L1Of(pairs, skyFitAmbient):F4}  per-ch R={tR / Math.Max(1, totW):F2} G={tG / Math.Max(1, totW):F2} B={tB / Math.Max(1, totW):F2}  (n={pairs.Count})");
             }
-            double[] xc = SolveLeastSquares(Gc, 2, hc, 1e-9 * Math.Max(1.0, (Gc[0, 0] + Gc[1, 1]) / 2));
             foreach (var (id, w) in poolW) pairs[id] = pairs[id] with { Weight = w };
-            // per-point frozen correction = skyFitAmbient + gain·sky + offset
-            var ambientExt = new List<(double R, double G, double B)>(pairs.Count);
-            for (int id = 0; id < pairs.Count; id++)
-            {
-                var a = skyFitAmbient[id];
-                double cr = a.R, cg = a.G, cb = a.B;
-                for (int m = 0; m < 2; m++)
-                {
-                    double s = xc[m] * corrBasis[m].G[id];
-                    cr += s * corrBasis[m].VR; cg += s * corrBasis[m].VG; cb += s * corrBasis[m].VB;
-                }
-                ambientExt.Add((cr, cg, cb));
-            }
-            return (xc[0], xc[1], spatial, ambientExt);
+            return (gain, offset, spatial, modelOffset, ambientExt);
         }
 
         /// <summary>
@@ -2093,18 +2140,24 @@ namespace JKDecompiler.Core
             // light pool trades the constant against overlapping pools and
             // drives light scales negative. Not emitted to fit.map.
             //
-            // SPATIAL (no-sky A/B available, 3b): basis = measured wash
-            // (probe − noSky), target = orig − noSky on ALL points — with a
-            // spatial basis the bright points are where the gain is learned,
-            // so no bright-point mask. FALLBACK (no sky / A/B failed): the
-            // 0/1 presence indicator + mask, as before.
-            var (skyGain, skyOffset, skySpatial, ambientExt) =
+            // SPATIAL (no-sky A/B available, 3b): model = probe + constant
+            // offset — carries the wash exactly as BAKED, so the model is
+            // what stage-A actually bakes (probe + fitted lights). The
+            // reported gain/offset are a diagnostic [wash, const] fit on the
+            // strong-wash points (the value-calibration hint). Pool points
+            // (inside a fitted light field) are excluded from all fits.
+            // FALLBACK (no sky / A/B failed): the 0/1 presence indicator +
+            // bright-point mask, as before.
+            var (skyGain, skyOffset, skySpatial, skyModelOffset, ambientExt) =
                 FitSkyCorrection(pairs, ambientVals, ambientNoSky, singleFields);
             res.SkyGain = skyGain;
             res.SkyOffset = skyOffset;
             res.SkySpatial = skySpatial;
-            Console.Error.WriteLine($"[sky] step correction: {(skySpatial ? "spatial" : "indicator")} gain={skyGain:F4} offset={skyOffset:F3}/ch" +
-                (skySpatial ? $" — the map's wash at skyLight {Options.SkyLightValue:0.##} needs ×{skyGain:0.##} to match the original (set --sky-value {Options.SkyLightValue * skyGain:0.##})" : ""));
+            res.SkyModelOffset = skyModelOffset;
+            Console.Error.WriteLine($"[sky] step correction: {(skySpatial ? "spatial" : "indicator")} model offset={skyModelOffset:F3}/ch" +
+                (skySpatial
+                    ? $" | diagnostic gain={skyGain:F4} offset={skyOffset:F3}/ch — the baked wash at skyLight {Options.SkyLightValue:0.##} needs ×{skyGain:0.##} to match the original (set --sky-value {Options.SkyLightValue * skyGain:0.##})"
+                    : $" | gain={skyGain:F4} offset={skyOffset:F3}/ch"));
 
             // 5b. greedy forward selection (robust to overlapping pools), then
             // a joint LSQ polish on the selected set. Lights only — the sky
@@ -2650,7 +2703,7 @@ namespace JKDecompiler.Core
                 ["q3map2"] = Q3map2Bin,
                 ["gameDir"] = GameDir,
                 ["ambientOffset"] = new[] { c0[0], c0[1], c0[2] },
-                ["skyCorrection"] = new { gain = res.SkyGain, offsetPerChannel = res.SkyOffset, spatial = res.SkySpatial },
+                ["skyCorrection"] = new { gain = res.SkyGain, offsetPerChannel = res.SkyOffset, spatial = res.SkySpatial, modelOffsetPerChannel = res.SkyModelOffset },
                 ["points"] = new { matched = res.MatchedPoints, unmatched = res.UnmatchedPoints },
                 ["error"] = new
                 {
