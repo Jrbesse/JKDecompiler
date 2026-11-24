@@ -2652,14 +2652,31 @@ namespace JKDecompiler.Core
                                     + EntityText(lights[l], lights[l].Name, Options.WriteJkaFormat);
                                 var c = CompileMap(variant, $"fit_r{l:D3}_{cands[idx]}", scratchRoot, out BspData? bsp);
                                 Interlocked.Increment(ref res.CompilesRun);
+                                // MUST carry the have[] gate exactly like the single
+                                // fields (Fit step 4): without it, no-face points
+                                // (sky box / geometry gap — ~44% of the weight on
+                                // academy1) get raw=(0,0,0) and the subtraction
+                                // below turns them into a −ambient (−65/ch)
+                                // negative lobe. The lobe is identical across
+                                // candidates (raw is 0 everywhere no face exists),
+                                // so it CANCELLED in the radius ranking — Radfit
+                                // looked healthy — but the winner field inherited
+                                // it into singleFields, where the stage-A
+                                // modelFill (ambient + Σ gscales·field) added it
+                                // back at the gate: fitrun31/32 measured 201.49/
+                                // 201.53 while an offline re-sample of the same
+                                // saved stage-A bake measured 75.32.
+                                var have = new bool[pairs.Count];
                                 var raw = c.HasLightmaps && bsp != null
-                                    ? SampleCandidate(bsp, BuildSampleFaces(bsp), pairs)
+                                    ? SampleCandidate(bsp, BuildSampleFaces(bsp), pairs, have)
                                     : Enumerable.Repeat((R: 0.0, G: 0.0, B: 0.0), pairs.Count).ToList();
                                 var fld = new List<(double R, double G, double B)>(raw.Count);
                                 for (int q = 0; q < raw.Count; q++)
-                                    fld.Add((raw[q].R - ambient[q].R,
-                                             raw[q].G - ambient[q].G,
-                                             raw[q].B - ambient[q].B));
+                                    fld.Add(have[q]
+                                        ? (raw[q].R - ambient[q].R,
+                                           raw[q].G - ambient[q].G,
+                                           raw[q].B - ambient[q].B)
+                                        : (R: 0.0, G: 0.0, B: 0.0));
                                 cFields[idx] = fld;
                             }
                             finally { gate.Release(); }

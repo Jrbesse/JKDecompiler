@@ -21,7 +21,133 @@ namespace JKDecompiler.Tests;
 public class Fitrun31DiagTest
 {
     const string Run = "/tmp/lfit/fitrun31";
+    const string Run32 = "/tmp/lfit/fitrun32";
     const string OrigBsp = "/tmp/lfit/src/academy1.bsp";
+
+    /// <summary>
+    /// fitrun32 (instrumented): diff the run's OWN stage-A measurement
+    /// (stagea_dbg.json: allVals + gscales + l1) against an offline
+    /// re-sample of the saved fit_stageA.bsp. Answers: (a) is the run's
+    /// l1 consistent with its own vals? (b) where do the run's vals
+    /// diverge from the re-sample, and by how much?
+    /// </summary>
+    [Fact]
+    public void DiffRunMeasurementVsResample()
+    {
+        string dbgPath = Path.Combine(Run32, "scratch", "stagea_dbg.json");
+        string stageAPath = Path.Combine(Run32, "scratch", "fit_stageA", "fit_stageA.bsp");
+        if (!File.Exists(dbgPath) || !File.Exists(stageAPath)) return;
+
+        var dbg = JsonDocument.Parse(File.ReadAllText(dbgPath));
+        double l1Run = dbg.RootElement.GetProperty("l1").GetDouble();
+        var gsRun = dbg.RootElement.GetProperty("gscales").EnumerateArray().Select(e => e.GetDouble()).ToArray();
+        var allVals = dbg.RootElement.GetProperty("allVals").EnumerateArray().Select(e => e.GetDouble()).ToArray();
+
+        var probe = new BspReader().Read(Path.Combine(Run32, "scratch", "fit_probe", "fit_probe.bsp"));
+        var stageA = new BspReader().Read(stageAPath);
+        var ff = new LightFit("", "");
+        int nL = gsRun.Length;
+        var singles = Enumerable.Range(0, nL)
+            .Select(i => new BspReader().Read(Path.Combine(Run32, "scratch", $"fit_s{i:D3}", $"fit_s{i:D3}.bsp")))
+            .ToList();
+
+        var orig = new BspReader().Read(OrigBsp);
+        var origFaces = LightFit.BuildSampleFaces(orig);
+        var probeFaces = LightFit.BuildSampleFaces(probe);
+        var (pairs, unmatched, matched) = ff.BuildOrigPairs(orig, origFaces, probe, probeFaces);
+        int nP = pairs.Count;
+        Assert.True(nP == allVals.Length / 3, $"pair count {nP} != dbg vals {allVals.Length / 3}");
+        var ambient = pairs.Select(p => (R: (double)p.CR, G: (double)p.CG, B: (double)p.CB)).ToList();
+        var fields = new double[nL][];
+        for (int l = 0; l < nL; l++)
+        {
+            var have = new bool[nP];
+            var raw = ff.SampleCandidate(singles[l], LightFit.BuildSampleFaces(singles[l]), pairs, have);
+            fields[l] = new double[nP * 3];
+            for (int id = 0; id < nP; id++)
+            {
+                if (!have[id]) continue;
+                fields[l][id * 3 + 0] = raw[id].R - ambient[id].R;
+                fields[l][id * 3 + 1] = raw[id].G - ambient[id].G;
+                fields[l][id * 3 + 2] = raw[id].B - ambient[id].B;
+            }
+        }
+        // my re-sample of the saved stageA with the run's EXACT fill formula
+        var bakeValid = new bool[nP];
+        var mine = ff.SampleCandidate(stageA, LightFit.BuildSampleFaces(stageA), pairs, bakeValid,
+            modelFill: id =>
+            {
+                double r = ambient[id].R, g = ambient[id].G, b = ambient[id].B;
+                for (int l = 0; l < nL; l++)
+                {
+                    if (gsRun[l] == 0) continue;
+                    r += gsRun[l] * fields[l][id * 3 + 0];
+                    g += gsRun[l] * fields[l][id * 3 + 1];
+                    b += gsRun[l] * fields[l][id * 3 + 2];
+                }
+                return (r, g, b);
+            });
+        double L1(System.Collections.Generic.IReadOnlyList<(double R, double G, double B)> vals)
+        {
+            double tot = 0, w = 0;
+            for (int id = 0; id < nP; id++)
+            {
+                var p = pairs[id];
+                tot += p.Weight * (Math.Abs(p.OR - vals[id].R) + Math.Abs(p.OG - vals[id].G) + Math.Abs(p.OB - vals[id].B));
+                w += p.Weight;
+            }
+            return w > 0 ? tot / w : 0;
+        }
+        var runTuples = new (double R, double G, double B)[nP];
+        for (int id = 0; id < nP; id++)
+            runTuples[id] = (allVals[id * 3], allVals[id * 3 + 1], allVals[id * 3 + 2]);
+        double l1RunVals = L1(runTuples);   // the run's own vals, my pairs
+        double l1Mine = L1(mine);
+
+        // point-for-point divergence between the run's vals and my re-sample
+        long nDiv = 0; double wDiv = 0, wTot = 0;
+        var divs = new List<(double D, object Row)>();
+        for (int id = 0; id < nP; id++)
+        {
+            var p = pairs[id];
+            double d = Math.Abs(runTuples[id].R - mine[id].R) + Math.Abs(runTuples[id].G - mine[id].G) + Math.Abs(runTuples[id].B - mine[id].B);
+            wTot += p.Weight;
+            if (d > 0.5)
+            {
+                nDiv++; wDiv += p.Weight;
+                divs.Add((d, (object)new { id, x = p.X, y = p.Y, z = p.Z,
+                    run = new[] { runTuples[id].R, runTuples[id].G, runTuples[id].B },
+                    mine = new[] { mine[id].R, mine[id].G, mine[id].B },
+                    o = new[] { p.OR, p.OG, p.OB }, d }));
+            }
+        }
+        var worst = divs.OrderByDescending(t => t.D).Take(60).Select(t => t.Row).ToList();
+        // sampled-vs-fill split of the RUN's vals
+        double sErr = 0, sW = 0, fErr = 0, fW = 0; int nS = 0, nF = 0;
+        for (int id = 0; id < nP; id++)
+        {
+            var p = pairs[id];
+            double e = p.Weight * (Math.Abs(p.OR - mine[id].R) + Math.Abs(p.OG - mine[id].G) + Math.Abs(p.OB - mine[id].B));
+            if (bakeValid[id]) { sErr += e; sW += p.Weight; nS++; } else { fErr += e; fW += p.Weight; nF++; }
+        }
+        var report = new
+        {
+            l1RunReported = l1Run,
+            l1RunValsRescored = Math.Round(l1RunVals, 3),
+            l1MyResample = Math.Round(l1Mine, 3),
+            l1MyResampleSampled = Math.Round(sW > 0 ? sErr / sW : 0, 3),
+            l1MyResampleFill = Math.Round(fW > 0 ? fErr / fW : 0, 3),
+            nSampled = nS, nFill = nF,
+            nDivergent = nDiv,
+            weightFracDivergent = Math.Round(wTot > 0 ? wDiv / wTot : 0, 4),
+            gsRun,
+            worstDivergences = worst,
+        };
+        string outPath = Path.Combine(Run32, "fitrun32_diag.json");
+        File.WriteAllText(outPath, System.Text.Json.JsonSerializer.Serialize(report, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+        double pctDiv = wTot > 0 ? 100 * wDiv / wTot : 0;
+        Console.WriteLine($"[diag32] runL1={l1Run:F2} runValsRescored={l1RunVals:F2} myResample={l1Mine:F2} div={nDiv} ({pctDiv:F1}%w) → {outPath}");
+    }
 
     [Fact]
     public void DecomposeStageABakeVsModel()
@@ -145,6 +271,32 @@ public class Fitrun31DiagTest
         var radfitNnls5 = new double[nL];
         var xN5 = n5c > 0 ? LightFit.NnlsSolve(G5c, h5c, 1e-3 * Math.Max(1.0, tr5c / n5c)) : Array.Empty<double>();
         for (int k = 0; k < sel5.Count; k++) radfitNnls5[sel5[k]] = xN5[k];
+
+        // DROP-PASS check: leave-one-out ΔE per light, current (plain LSQ,
+        // 1e-6 ridge) vs proposed (NNLS, 1e-3 ridge). If the plain-LSQ ΔEs
+        // are ~0 for lights with substantial scale (m6_02 @ 0.353), the
+        // pre-gate drop is running on an ill-conditioned solve.
+        double rmsFitAll = LightFit.RmsOf1D(pairs, basis, g5, ambientExt);
+        var dEPlain = new double[nL];
+        var dENnls = new double[nL];
+        for (int l = 0; l < nL; l++)
+        {
+            if (g5[l] == 0) continue;
+            var activeIdx = Enumerable.Range(0, nL).Where(m => m != l && g5[m] != 0).ToList();
+            var (Gd1, hd1) = LightFit.BuildGh1D(pairs, ambientExt, basis, activeIdx);
+            int nd = Gd1.GetLength(0);
+            double trd = 0;
+            for (int i = 0; i < nd; i++) trd += Gd1[i, i];
+            var xdP = nd > 0 ? LightFit.SolveLeastSquares(Gd1, nd, hd1, Math.Max(1e-4, (trd / nd) * 1e-6)) : Array.Empty<double>();
+            var gdP = new double[nL];
+            for (int k = 0; k < activeIdx.Count; k++) gdP[activeIdx[k]] = Math.Max(0, xdP[k]);
+            dEPlain[l] = LightFit.RmsOf1D(pairs, basis, gdP, ambientExt) - rmsFitAll;
+            var (Gd2, hd2) = LightFit.BuildGh1D(pairs, ambientExt, basis, activeIdx);
+            var xdN = nd > 0 ? LightFit.NnlsSolve(Gd2, hd2, 1e-3 * Math.Max(1.0, trd / nd)) : Array.Empty<double>();
+            var gdN = new double[nL];
+            for (int k = 0; k < activeIdx.Count; k++) gdN[activeIdx[k]] = xdN[k];
+            dENnls[l] = LightFit.RmsOf1D(pairs, basis, gdN, ambientExt) - rmsFitAll;
+        }
 
         // model = probe + c + Σ gscales·field
         var model = new (double R, double G, double B)[nP];
@@ -277,9 +429,49 @@ public class Fitrun31DiagTest
                 if (m > 0.5) fillFieldNz[l]++;
             }
         }
+        // HAVE[] at fill points: the field is raw−ambient where have=true, 0
+        // otherwise — a have=true point with raw≈0 gives field≈−65 (negative
+        // lobe), which the mass check above misreads as "small". Count have
+        // directly and dump the raw distribution.
+        var fillHave = new int[nL];
+        var fillRawSum = new double[nL];
+        for (int l = 0; l < nL; l++)
+        {
+            var have = new bool[nP];
+            var raw = ff.SampleCandidate(singles[l], LightFit.BuildSampleFaces(singles[l]), pairs, have);
+            int n = 0; double rs = 0;
+            for (int id = 0; id < nP; id++)
+            {
+                if (bakeValid[id] || !have[id]) continue;
+                n++; rs += (raw[id].R + raw[id].G + raw[id].B) / 3.0;
+            }
+            fillHave[l] = n;
+            fillRawSum[l] = n > 0 ? rs / n : 0;
+        }
         // L1(original vs X) for alternative lightmaps with the run's fill
         // logic (ambient + all-9 gscales·field), to see if 201.49 matches one.
         var altNames = new[] { "fit_r005_980", "fit_r004_1062", "fit_r001_630", "fit_s005", "fit_s004", "fit_s001" };
+        // FIELD ENERGY of the on-disk radius candidates (sw_03→630, sw_05→980):
+        // the run's stagea_dbg fillEnergyPerLight showed −867M/−1378M for
+        // exactly these two — if the on-disk candidates give ≈0, the run's
+        // in-memory candidate BSPs were not the files on disk.
+        var candEnergy = new Dictionary<string, double>();
+        foreach (var cn in new[] { "fit_r003_630", "fit_r005_980", "fit_r001_630", "fit_r004_765" })
+        {
+            string cp = Path.Combine(Run, "scratch", cn, cn + ".bsp");
+            if (!File.Exists(cp)) continue;
+            var haveC = new bool[nP];
+            var rawC = ff.SampleCandidate(new BspReader().Read(cp), LightFit.BuildSampleFaces(new BspReader().Read(cp)), pairs, haveC);
+            double e = 0, eFill = 0, eSamp = 0; int nHave = 0, nHaveFill = 0;
+            for (int id = 0; id < nP; id++)
+            {
+                double f = haveC[id] ? (rawC[id].R + rawC[id].G + rawC[id].B) / 3.0 - (ambient[id].R + ambient[id].G + ambient[id].B) / 3.0 : 0;
+                e += pairs[id].Weight * f;
+                if (haveC[id]) { nHave++; if (!bakeValid[id]) { eFill += pairs[id].Weight * f; nHaveFill++; } else eSamp += pairs[id].Weight * f; }
+            }
+            candEnergy[cn] = Math.Round(e, 1);
+            Console.WriteLine($"[cand] {cn}: energy={e:F1} nHave={nHave} nHaveAtFill={nHaveFill} eFill={eFill:F1} eSamp={eSamp:F1}");
+        }
         var altL1s = new Dictionary<string, double>();
         foreach (var nm in altNames)
         {
@@ -370,6 +562,8 @@ public class Fitrun31DiagTest
             radfitPolishNnls = radfitNnls.Select(v => Math.Round(v, 4)).ToArray(),
             radfitPolishPlain5 = radfitPlain5.Select(v => Math.Round(v, 4)).ToArray(),
             radfitPolishNnls5 = radfitNnls5.Select(v => Math.Round(v, 4)).ToArray(),
+            deltaEPlainLsq = dEPlain.Select(v => Math.Round(v, 3)).ToArray(),
+            deltaENnls = dENnls.Select(v => Math.Round(v, 3)).ToArray(),
             l1AmbientOnly = Math.Round(l1Amb, 3),
             l1BakeReconstructed = Math.Round(l1Bake, 3),
             l1BakeRun = 201.487,
@@ -380,8 +574,11 @@ public class Fitrun31DiagTest
             runReportedStageA = 201.487,
             candidates = candidates.Select(kv => kv.Key + "=" + kv.Value.ToString("F2")).ToArray(),
             altLightmapL1 = altL1s.Select(kv => kv.Key + "=" + kv.Value.ToString("F2")).ToArray(),
+            candEnergyOnDisk = candEnergy,
             fillFieldMassByLight = fillFieldMass.Select(v => Math.Round(v, 1)).ToArray(),
             fillFieldNzByLight = fillFieldNz,
+            fillHaveCountByLight = fillHave,
+            fillRawMeanByLight = fillRawSum.Select(v => Math.Round(v, 2)).ToArray(),
             unexplainedBakeMinusLinearSampled = Math.Round(unexplained, 3),
             weightFracUnexplainedPos = Math.Round(unexplainedPos / pairs.Sum(p => p.Weight), 4),
             weightFracUnexplainedNeg = Math.Round(unexplainedNeg / pairs.Sum(p => p.Weight), 4),
