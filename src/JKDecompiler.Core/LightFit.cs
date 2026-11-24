@@ -1304,11 +1304,15 @@ namespace JKDecompiler.Core
         /// <summary>
         /// Lawson–Hanson non-negative least squares: min ||Gs − h||² subject to
         /// s ≥ 0. Exact active-set algorithm — converges in finite steps for a
-        /// positive-definite G. Used on the greedy-selected light set, where the
-        /// normal equations are ill-conditioned (overlapping monochrome pools) and
-        /// clamped coordinate descent oscillates. Ridge (relative to mean diagonal)
-        /// is added by the caller for conditioning; it makes the solution the
-        /// exact optimum of the slightly regularized problem, which for relative
+        /// positive-definite G. Used as the 5b selection itself: the JOINT fit
+        /// over all candidate fields (overlapping monochrome pools included —
+        /// naive unconstrained Gaussian elimination collapsed every scale to
+        /// ~0 on academy1, and unclamped BCD oscillates: 42.86→41.47→42.17 vs
+        /// greedy 41.20). NNLS solves the box-constrained problem exactly and
+        /// is guaranteed ≤ the error of any feasible point — including the
+        /// ambient-only zero vector. Ridge (relative to mean diagonal) is added
+        /// by the caller for conditioning; it makes the solution the exact
+        /// optimum of the slightly regularized problem, which for relative
         /// ridge 1e-3 differs from the unregularized optimum by ~0.1% in scale.
         /// </summary>
         public static double[] NnlsSolve(double[,] G, double[] h, double ridge = 0.0)
@@ -1428,12 +1432,17 @@ namespace JKDecompiler.Core
         }
 
         /// <summary>
-        /// Greedy forward selection (orthogonal matching pursuit) over the scalar
-        /// light fields. Each round picks the unused light whose 1D projection onto
-        /// the current residual has the largest weighted gain, and subtracts it.
-        /// Robust where pools overlap: the first light of a cluster absorbs the
-        /// shared signal, the twins project to ~0 and are never selected.
-        /// Returns the selection order and scalar scales (per light index).
+        /// LEGACY 5b path (restored with JKD_SELECT_GREEDY=1): greedy forward
+        /// selection (orthogonal matching pursuit) over the scalar light
+        /// fields. Each round picks the unused light whose 1D projection onto
+        /// the current residual has the largest weighted gain, and subtracts
+        /// it. Robust where pools overlap: the first light of a cluster
+        /// absorbs the shared signal, the twins project to ~0 and are never
+        /// selected. That "robustness" is exactly the defect — on academy1's
+        /// six wall washers the twins are REAL lights (single-light control
+        /// passes the gate) and hard selection zeroes them; the joint NNLS is
+        /// the primary path now. Returns the selection order and scalar scales
+        /// (per light index).
         /// </summary>
         internal static (List<int> Order, double[] Scales)
             FitGreedy1D(List<SamplePair> pairs, List<(double R, double G, double B)> ambient,
@@ -2164,34 +2173,65 @@ namespace JKDecompiler.Core
                     ? $" | diagnostic gain={skyGain:F4} offset={skyOffset:F3}/ch — the baked wash at skyLight {Options.SkyLightValue:0.##} needs ×{skyGain:0.##} to match the original (set --sky-value {Options.SkyLightValue * skyGain:0.##})"
                     : $" | gain={skyGain:F4} offset={skyOffset:F3}/ch"));
 
-            // 5b. greedy forward selection (robust to overlapping pools), then
-            // a joint LSQ polish on the selected set. Lights only — the sky
-            // correction is a fixed per-point offset now.
+            // 5b. JOINT non-negative least squares over ALL candidate fields —
+            // no pre-selection. The old greedy hard selection + subset polish
+            // was the multi-light gate blocker: on overlapping collinear pool
+            // clusters (academy1's six wall washers, radius 900 stacked on the
+            // same wall) the FIRST picked light absorbs the shared signal, so
+            // the neighbors' residual improvement is ~0 — dropped with ΔE=0.00
+            // even though a single-light control proved them good in isolation
+            // (fitrun29: greedy kept 5 of 9, zeroed sw_01/02/04; the 5-light
+            // bake 151.21 was WORSE than the 1-light bake 97.88). NNLS is the
+            // exact constrained optimum over the whole field set: correlated
+            // columns share the signal through the normal equations instead of
+            // one column swallowing it, and the relative ridge keeps the
+            // (near)rank-deficient block finite. Dead seeds (no signal anywhere)
+            // land at scale 0 exactly as before — the drop pass below still
+            // prunes them. JKD_SELECT_GREEDY=1 restores the legacy greedy +
+            // subset-polish path for A/B.
             var basis = new List<LightBasis>();
             for (int l = 0; l < nL; l++) basis.Add(BuildBasis(singleFields[l]));
             int nB = basis.Count;
-            var (greedyOrder, gscales) = FitGreedy1D(pairs, ambientExt, basis, nB);
-            if (greedyOrder.Count >= 2)
+            double[] gscales;
+            var allIdx = Enumerable.Range(0, nB).ToList();
+            if (Environment.GetEnvironmentVariable("JKD_SELECT_GREEDY") == "1")
             {
-                // Non-negative least squares (Lawson–Hanson) on the selected set.
-                // The joint normal equations for overlapping monochrome pools are
-                // ill-conditioned (naive Gaussian elimination collapsed every scale
-                // to ~0 on academy1; unclamped BCD oscillates: 42.86→41.47→42.17
-                // vs greedy 41.20). NNLS solves the box-constrained problem exactly
-                // and is guaranteed ≤ the error of any feasible point — including
-                // the ambient-only zero vector and the clamped greedy solution.
-                var (Gp, hp) = BuildGh1D(pairs, ambientExt, basis, greedyOrder);
-                double trp = 0;
+                // Legacy path: greedy forward selection + NNLS polish on the
+                // selected subset.
+                var (greedyOrder, g0) = FitGreedy1D(pairs, ambientExt, basis, nB);
+                gscales = g0;
+                if (greedyOrder.Count >= 2)
+                {
+                    // The joint normal equations for overlapping monochrome
+                    // pools are ill-conditioned (naive Gaussian elimination
+                    // collapsed every scale to ~0 on academy1; unclamped BCD
+                    // oscillates). NNLS solves the box-constrained problem
+                    // exactly and is guaranteed ≤ the error of any feasible
+                    // point — including the ambient-only zero vector.
+                    var (Gg, hg) = BuildGh1D(pairs, ambientExt, basis, greedyOrder);
+                    int ng = Gg.GetLength(0);
+                    double trg = 0;
+                    for (int i = 0; i < ng; i++) trg += Gg[i, i];
+                    var xg = NnlsSolve(Gg, hg, 1e-3 * Math.Max(1.0, trg / ng));
+                    for (int k = 0; k < greedyOrder.Count; k++)
+                        gscales[greedyOrder[k]] = xg[k];
+                }
+                Console.Error.WriteLine($"[select] legacy greedy: {greedyOrder.Count} of {nB} selected scales=" +
+                    string.Join(" ", allIdx.ConvertAll(a => $"{a}:{gscales[a]:F3}")));
+            }
+            else
+            {
+                // JOINT NNLS (Lawson–Hanson) over all fields, ridged.
+                var (Gp, hp) = BuildGh1D(pairs, ambientExt, basis, allIdx);
                 int np = Gp.GetLength(0);
+                double trp = 0;
                 for (int i = 0; i < np; i++) trp += Gp[i, i];
                 double ridge = 1e-3 * Math.Max(1.0, trp / np);
-                double rmsGreedy = RmsOf1D(pairs, basis, gscales, ambientExt);
                 var xs = NnlsSolve(Gp, hp, ridge);
-                for (int k = 0; k < greedyOrder.Count; k++)
-                    gscales[greedyOrder[k]] = xs[k];
-                double rmsPolished = RmsOf1D(pairs, basis, gscales, ambientExt);
-                Console.Error.WriteLine($"[polish] NNLS greedyRms={rmsGreedy:F4} after={rmsPolished:F4} (ridge {ridge:F4}) scales=" +
-                    string.Join(" ", greedyOrder.ConvertAll(a => $"{a}:{gscales[a]:F3}")));
+                gscales = new double[nB];
+                for (int k = 0; k < xs.Length; k++) gscales[allIdx[k]] = xs[k];
+                Console.Error.WriteLine($"[select] joint NNLS over all {nB} fields (ridge {ridge:F4}) scales=" +
+                    string.Join(" ", allIdx.ConvertAll(a => $"{a}:{gscales[a]:F3}")));
             }
             double rmsFit = RmsOf1D(pairs, basis, gscales, ambientExt);
             var scales = new double[nL][];
@@ -2291,7 +2331,9 @@ namespace JKDecompiler.Core
             var survivorsA = lights.Where(l => l.Kept).ToList();
             if (Options.RadiusFit && survivorsA.Count > 0)
             {
-                var sel = greedyOrder.Where(l => lights[l].Kept && gscales[l] > 0).ToList();
+                // All positive-scale lights (joint NNLS: the "selection" is the
+                // whole field set; legacy greedy: unselected lights are 0).
+                var sel = Enumerable.Range(0, nL).Where(l => lights[l].Kept && gscales[l] > 0).ToList();
                 RefineRadii(pairs, singleFields, basis, lights, sel, ambientExt, gscales, baseText, dummyText, scratchRoot, res);
                 for (int l = 0; l < nL; l++)
                     scales[l] = new[] { gscales[l] * basis[l].VR, gscales[l] * basis[l].VG, gscales[l] * basis[l].VB };
