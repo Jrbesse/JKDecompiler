@@ -65,6 +65,11 @@ namespace JKDecompiler.Core
         public int Parallel = 2;          // concurrent compiles
         public double MinContributionPct = 0.5;  // drop lights below this share of fitted energy (%)
         public double MinDeltaEPct = 0.25;       // drop lights whose removal lowers error by less than this %
+        public double GateMarginL1 = 2.0;        // stage-A must beat ambient-only by at least this L1 — a
+                                                 // zero-light compile differs from the probe compile by
+                                                 // radiosity jitter alone (measured 0.87 on academy1:
+                                                 // 103.29 probe vs 102.42 zero-light), so any margin
+                                                 // below ~1.0 lets an empty/no-op set "pass"
         public int LightmapSize = 128;
         public bool WriteJkaFormat = false; // emit 4-value JKA "light" L R G B keys instead of Q3 light+_color
     }
@@ -1989,6 +1994,22 @@ namespace JKDecompiler.Core
                 }
             }
 
+            // 6b. if every candidate light was dropped, the survivor set is
+            // empty and the stage-A compile below would be a zero-light
+            // compile: its error differs from the probe's by compile jitter
+            // alone (measured 0.87 on academy1 — fitrun17 "passed" 102.42 vs
+            // 103.29 with kept=0 that way). Treat an empty survivor set as
+            // the same outcome as a gate fail: honest report, honest exit.
+            if (!lights.Any(l => l.Kept))
+            {
+                res.Note = "all candidate lights dropped by the per-light gate (none individually improves the fit) — emitting empty light set";
+                res.ErrorStageA = res.ErrorAmbientOnly;
+                res.ErrorFinal = res.ErrorAmbientOnly;
+                WriteReport(outDir, baseMapPath, mapLabel, lights, origBsp, c0, res, pairs, singleFields, probeBsp, 0);
+                WriteFitMap(baseText, lights, outDir, mapLabel, Options.WriteJkaFormat);
+                return res;
+            }
+
             // 7. radius hill-climb FIRST: under the JKA quadratic falloff the
             // radius sets the pool edge, so a wrong seed radius mis-shapes the
             // fields before the stage-A gate could ever see the real fit.
@@ -2033,9 +2054,9 @@ namespace JKDecompiler.Core
                 WriteReport(outDir, baseMapPath, mapLabel, lights, origBsp, c0, res, pairs, singleFields, probeBsp, 0);
                 return res;
             }
-            if (res.ErrorStageA >= res.ErrorAmbientOnly)
+            if (res.ErrorStageA > res.ErrorAmbientOnly - Options.GateMarginL1)
             {
-                res.Note = $"fitted lights do not beat ambient-only (E_fit={res.ErrorStageA:F2} >= E_ambient={res.ErrorAmbientOnly:F2}) — emitting empty light set";
+                res.Note = $"fitted lights do not beat ambient-only by the {Options.GateMarginL1:F1} L1 margin (E_fit={res.ErrorStageA:F2} vs E_ambient={res.ErrorAmbientOnly:F2}) — emitting empty light set";
                 foreach (var l in lights) if (l.Kept) { l.Kept = false; l.DropReason = "did not beat ambient-only"; }
                 // The emitted final set is empty: the final map IS the ambient-only
                 // map, so its error is the ambient baseline. (Leaving ErrorFinal=0
