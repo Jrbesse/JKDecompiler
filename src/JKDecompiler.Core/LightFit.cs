@@ -1120,6 +1120,11 @@ namespace JKDecompiler.Core
                 List<List<(double R, double G, double B)>> singleFields)
         {
             bool spatial = ambientNoSky != null;
+            // full-set L1s up front — the masks below zero weights, and the
+            // JKD_SKYDBG lines must show the honest full-set numbers
+            // (fitrun29's masked L1 read 65.2 vs the true 103.0).
+            double l1ProbeAll = L1Of(pairs, ambient);
+            double l1NoSkyAll = spatial ? L1Of(pairs, ambientNoSky!) : 0.0;
             var poolW = new List<(int Id, double W)>();
             for (int id = 0; id < pairs.Count; id++)
             {
@@ -1205,7 +1210,7 @@ namespace JKDecompiler.Core
                     Console.Error.WriteLine($"[skydbg] spatial mask: {poolW.Count} pool pts maskW={maskW:F0} totW={totW:F0} | strongWash={strong}");
                     Console.Error.WriteLine($"[skydbg] model: c={c:F3}/ch (non-pool mean of orig−probe)");
                     Console.Error.WriteLine($"[skydbg] diagnostic fit (strong-wash ∩ non-pool): G00={Gc[0, 0]:F0} G01={Gc[0, 1]:F0} G11={Gc[1, 1]:F0} h0={hc[0]:F0} h1={hc[1]:F0} → gain={gain:F4} offset={offset:F3}");
-                    Console.Error.WriteLine($"[skydbg] L1Of(pairs, probe) = {L1Of(pairs, ambient):F4} | L1Of(pairs, noSky) = {L1Of(pairs, ambientNoSky!):F4}  (n={pairs.Count})");
+                    Console.Error.WriteLine($"[skydbg] L1Of(all pairs, probe) = {l1ProbeAll:F4} | L1Of(all pairs, noSky) = {l1NoSkyAll:F4}  (n={pairs.Count})");
                 }
             }
             else
