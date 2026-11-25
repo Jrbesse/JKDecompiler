@@ -72,6 +72,9 @@ JKA uses a modified version of the Quake 3 BSP format, resetting the version to 
 
 
 
+## M2.5 Acceptance
+Light-entity recreation gate (convert → fit-lights on a fixture; assert Kept > 0 and ErrorFinal < ErrorAmbientOnly − 2.0): see `docs/M2.5-ACCEPTANCE.md`. Implemented as `EndToEndFitTest`, loud-skips (not silent) when fixtures/q3map2/game-dir are absent.
+
 ## Testing Resources
 - **Sample Map**: `t1_sour.bsp` (located in the project root) is used for validating JKA-specific features.
 
