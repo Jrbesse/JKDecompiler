@@ -137,6 +137,14 @@ namespace JKDecompiler.Core
     /// </summary>
     public class ConvertOrchestrator
     {
+    private static void ApplyQ3map2Env(ProcessStartInfo psi, string q3map2Bin)
+    {
+        // libassimp.so.5, libdraco.so.8 etc. live next to the q3map2 binary;
+        // without this the child dies with rc=127 (conversion path never set it).
+        psi.Environment["LD_LIBRARY_PATH"] =
+            Path.GetDirectoryName(q3map2Bin)
+            + (Environment.GetEnvironmentVariable("LD_LIBRARY_PATH") is { Length: > 0 } existing ? ":" + existing : "");
+    }
         public ConvertResult Convert(string bspPath, string q3map2Bin, string outDir, string game = "ja", int timeoutMinutes = 10, bool recompile = false)
         {
             // The garux fork resolves its VFS base path from the executable
@@ -164,6 +172,7 @@ namespace JKDecompiler.Core
                 }
             })
             {
+                ApplyQ3map2Env(proc.StartInfo, q3map2Bin);
                 proc.OutputDataReceived += (_, e) => { if (e.Data != null) log.AppendLine(e.Data); };
                 proc.ErrorDataReceived += (_, e) => { if (e.Data != null) log.AppendLine(e.Data); };
                 if (!proc.Start())
@@ -307,6 +316,7 @@ namespace JKDecompiler.Core
                 }
             })
             {
+                ApplyQ3map2Env(proc.StartInfo, q3map2Bin);
                 proc.OutputDataReceived += (_, e) => { if (e.Data != null) log.AppendLine(e.Data); };
                 proc.ErrorDataReceived += (_, e) => { if (e.Data != null) log.AppendLine(e.Data); };
                 if (!proc.Start()) throw new InvalidOperationException($"failed to start {q3map2Bin}");
