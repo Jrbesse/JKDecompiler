@@ -53,12 +53,12 @@ public static class SkyboxReconstruction
 
     /// <summary>
     /// q3map_skyLight value (linear in emitted photons) — the sky-wash
-    /// magnitude knob. 150 is the original uncalibrated value; the spatial
-    /// A/B fit reports the fitted gain, and this constant should carry
-    /// 150 × gain (calibrated so the fitted gain lands near 1). Re-tune via
-    /// --sky-value; the fit's residual gain tells you how far off it is.
+    /// magnitude knob. 130 is the calibrated mid-bracket default (owner
+    /// decision #16: 112–146 bracket, close to the ~118 face-level cross-check);
+    /// the fit's residual gain tells you how far off it is. Re-tune via
+    /// --sky-value.
     /// </summary>
-    public const double DefaultSkyLightValue = 150;
+    public const double DefaultSkyLightValue = 130;
 
     /// <summary>
     /// Overlay shader installed into the game VFS. q3map_skyLight auto-applies
