@@ -74,6 +74,12 @@ namespace JKDecompiler.Core
         public bool WriteJkaFormat = false; // emit 4-value JKA "light" L R G B keys instead of Q3 light+_color
         /// <summary>q3map_skyLight value for the fit/sky overlay — the sky-wash magnitude knob.</summary>
         public double SkyLightValue = SkyboxReconstruction.DefaultSkyLightValue;
+        /// <summary>Directional sun intensity for the fit/sky overlay (0 = no sun key — back-compat).</summary>
+        public double SunIntensity = 0;
+        /// <summary>Sun azimuth in degrees — 0 = from the east, 90 = north (JKA convention).</summary>
+        public double SunDegrees = 120;
+        /// <summary>Sun elevation in degrees — 0 = horizon, 90 = noon.</summary>
+        public double SunElevation = 40;
     }
 
     public class LightFitResult
@@ -1831,9 +1837,11 @@ namespace JKDecompiler.Core
             {
                 (baseText, skyRetextured) = SkyboxReconstruction.RetextureSky(strippedText, skyTextures);
                 string shaderPath = SkyboxReconstruction.InstallShader(GameDir,
-                    SkyboxReconstruction.SkyImageBase(origBsp), Options.SkyLightValue);
+                    SkyboxReconstruction.SkyImageBase(origBsp), Options.SkyLightValue,
+                    Options.SunIntensity, Options.SunDegrees, Options.SunElevation);
                 Console.Error.WriteLine($"[sky] re-textured {skyRetextured} sky sides " +
-                    $"({string.Join(", ", skyTextures)}) → {SkyboxReconstruction.TextureName}, shader {shaderPath} (skyLight {Options.SkyLightValue:0.##})");
+                    $"({string.Join(", ", skyTextures)}) → {SkyboxReconstruction.TextureName}, shader {shaderPath} (" +
+                    (Options.SunIntensity > 0 ? $"sun {Options.SunIntensity:0.##} @ {Options.SunDegrees:0.##}°/{Options.SunElevation:0.##}°" : $"skyLight {Options.SkyLightValue:0.##}") + ")");
             }
 
             // 3. compile targets: original lightmap values at shared world points
@@ -2183,7 +2191,9 @@ namespace JKDecompiler.Core
             res.SkyModelOffset = skyModelOffset;
             Console.Error.WriteLine($"[sky] step correction: {(skySpatial ? "spatial" : "indicator")} model offset={skyModelOffset:F3}/ch" +
                 (skySpatial
-                    ? $" | diagnostic gain={skyGain:F4} offset={skyOffset:F3}/ch — the baked wash at skyLight {Options.SkyLightValue:0.##} needs ×{skyGain:0.##} to match the original (set --sky-value {Options.SkyLightValue * skyGain:0.##})"
+                    ? (Options.SunIntensity > 0
+                        ? $" | diagnostic gain={skyGain:F4} offset={skyOffset:F3}/ch — the baked wash at sun {Options.SunIntensity:0.##} needs ×{skyGain:0.##} to match the original (set --sun-intensity {Options.SunIntensity * skyGain:0.##})"
+                        : $" | diagnostic gain={skyGain:F4} offset={skyOffset:F3}/ch — the baked wash at skyLight {Options.SkyLightValue:0.##} needs ×{skyGain:0.##} to match the original (set --sky-value {Options.SkyLightValue * skyGain:0.##})")
                     : $" | gain={skyGain:F4} offset={skyOffset:F3}/ch"));
 
             // 5b. JOINT non-negative least squares over ALL candidate fields —

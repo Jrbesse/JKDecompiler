@@ -224,6 +224,51 @@ public class SkyboxReconstructionTests
     }
 
     [Fact]
+    public void InstallShader_NoSunKey_WhenIntensityZero()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "jk_skytest_" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            string text = File.ReadAllText(SkyboxReconstruction.InstallShader(dir, "textures/skies/yavin", 130.0, 0));
+            Assert.DoesNotContain("sun ", text);
+            Assert.Contains("q3map_skyLight     130 16 -90 90 1", text);
+        }
+        finally { if (Directory.Exists(dir)) Directory.Delete(dir, true); }
+    }
+
+    [Fact]
+    public void InstallShader_SunKey_EmittedWithValueAndAngles()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "jk_skytest_" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            string text = File.ReadAllText(SkyboxReconstruction.InstallShader(dir, "textures/skies/yavin", 130.0, 180, 120, 40));
+            Assert.Contains("sun 1.000 0.540 0.629 180 120 40", text);
+            // sun replaces the radial q3map_skyLight key (game-shader convention)
+            Assert.DoesNotContain("q3map_skyLight", text);
+            // sun key is idempotent — same content → same bytes
+            string path = SkyboxReconstruction.InstallShader(dir, "textures/skies/yavin", 130.0, 180, 120, 40);
+            Assert.Equal(text, File.ReadAllText(path));
+        }
+        finally { if (Directory.Exists(dir)) Directory.Delete(dir, true); }
+    }
+
+    [Fact]
+    public void InstallShader_SunKey_RewritesFile_OnChange()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "jk_skytest_" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            SkyboxReconstruction.InstallShader(dir, "textures/skies/yavin", 130.0, 180, 120, 40);
+            SkyboxReconstruction.InstallShader(dir, "textures/skies/yavin", 130.0, 250, 40, 60);
+            string text = File.ReadAllText(Path.Combine(dir, "base", "shaders", "fit_sky.shader"));
+            Assert.Contains("sun 1.000 0.540 0.629 250 40 60", text);
+            Assert.DoesNotContain("180 120 40", text);
+        }
+        finally { if (Directory.Exists(dir)) Directory.Delete(dir, true); }
+    }
+
+    [Fact]
     public void InstallShader_WritesOverlayWithSkyLightKey()
     {
         var dir = Path.Combine(Path.GetTempPath(), "jk_skytest_" + Guid.NewGuid().ToString("N"));
