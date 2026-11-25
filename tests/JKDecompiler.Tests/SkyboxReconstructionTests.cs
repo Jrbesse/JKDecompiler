@@ -244,7 +244,8 @@ public class SkyboxReconstructionTests
         {
             string text = File.ReadAllText(SkyboxReconstruction.InstallShader(dir, "textures/skies/yavin", 130.0, 180, 120, 40));
             Assert.Contains("sun 1.000 0.540 0.629 180 120 40", text);
-            Assert.Contains("q3map_skyLight     130 16 -90 90 1", text);
+            // sun replaces the radial q3map_skyLight key (game-shader convention)
+            Assert.DoesNotContain("q3map_skyLight", text);
             // sun key is idempotent — same content → same bytes
             string path = SkyboxReconstruction.InstallShader(dir, "textures/skies/yavin", 130.0, 180, 120, 40);
             Assert.Equal(text, File.ReadAllText(path));

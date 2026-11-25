@@ -62,7 +62,7 @@ public static class SkyboxReconstruction
 
     /// <summary>
     /// Overlay shader source. When <paramref name="sunIntensity"/> &gt; 0, the
-    /// shader also carries a <c>sun</c> key — the game's own directional wash
+    /// shader carries ONLY a <c>sun</c> key — the game's own directional wash
     /// (q3map_sun <red> <green> <blue> <intensity> <degrees> <elevation>;
     /// degree 0 = from the east, 90 = north, altitude 0 = horizon/90 = noon).
     /// The single q3map_skyLight value is radially symmetric; the directional
@@ -74,25 +74,31 @@ public static class SkyboxReconstruction
         double sunIntensity = 0, double sunDegrees = 120, double sunElevation = 40,
         double sunR = 1.0, double sunG = 0.54, double sunB = 0.629)
     {
-        string text = $$"""
-            textures/{{texture}}
-            {
-                qer_editorimage    textures/skies/sky.tga
-                surfaceparm        noimpact
-                surfaceparm        nomarks
-                notc
-                q3map_nolightmap
-                skyParms           {{imageBase}} 512 -
-                q3map_skyLight     {{skyLightValue:0.##}} 16 -90 90 1
-            }
-            """;
+        // Sun-enabled overlay (game-shader convention, e.g. textures/mp/h_yavin:
+        // only `sun`, plus q3map_surfacelight by the bake) — the directional sun
+        // REPLACES the radially-symmetric q3map_skyLight key. Carrying both
+        // double-counts wash energy (measured 0/7 kept + negative gain on the
+        // capped smoke). Intensity 0 emits no sun key and is byte-identical to
+        // the single-value overlay (back-compat).
+        var body = new System.Text.StringBuilder();
+        body.Append("textures/").Append(texture).Append("\n{\n");
+        body.Append("    qer_editorimage    textures/skies/sky.tga\n");
+        body.Append("    surfaceparm        noimpact\n");
+        body.Append("    surfaceparm        nomarks\n");
+        body.Append("    notc\n");
+        body.Append("    q3map_nolightmap\n");
+        body.Append("    skyParms           ").Append(imageBase).Append(" 512 -\n");
         if (sunIntensity > 0)
         {
-            string sun = $"    sun {sunR:0.000} {sunG:0.000} {sunB:0.000} {sunIntensity:0.##} {sunDegrees:0.##} {sunElevation:0.##}";
-            int close = text.LastIndexOf('}');
-            text = text.Substring(0, close) + sun + "\n" + text.Substring(close);
+            body.Append("    sun ")
+                .Append($"{sunR:0.000} {sunG:0.000} {sunB:0.000} {sunIntensity:0.##} {sunDegrees:0.##} {sunElevation:0.##}\n");
         }
-        return text;
+        else
+        {
+            body.Append("    q3map_skyLight     ").Append($"{skyLightValue:0.##} 16 -90 90 1\n");
+        }
+        body.Append("}\n");
+        return body.ToString();
     }
 
     /// <summary>
@@ -185,8 +191,9 @@ public static class SkyboxReconstruction
     /// loads it: with no shaders/shaderlist.txt present, q3map2 loads every
     /// .shader file under the VFS "shaders" directory (loose dirs + pk3s), so
     /// &lt;gameDir&gt;/base/shaders/fit_sky.shader is picked up. Idempotent; a
-    /// changed <paramref name="skyLightValue"/> rewrites the file (the value
-    /// is the wash-magnitude calibration knob).
+    /// changed <paramref name="skyLightValue"/>/<paramref name="sunIntensity"/>
+    /// rewrites the file (the values are the wash-magnitude calibration knobs;
+    /// sun replaces skyLight when intensity &gt; 0).
     /// </summary>
     public static string InstallShader(string gameDir, string imageBase,
         double skyLightValue = DefaultSkyLightValue,

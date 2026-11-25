@@ -1840,8 +1840,8 @@ namespace JKDecompiler.Core
                     SkyboxReconstruction.SkyImageBase(origBsp), Options.SkyLightValue,
                     Options.SunIntensity, Options.SunDegrees, Options.SunElevation);
                 Console.Error.WriteLine($"[sky] re-textured {skyRetextured} sky sides " +
-                    $"({string.Join(", ", skyTextures)}) → {SkyboxReconstruction.TextureName}, shader {shaderPath} (skyLight {Options.SkyLightValue:0.##}" +
-                    (Options.SunIntensity > 0 ? $", sun {Options.SunIntensity:0.##} @ {Options.SunDegrees:0.##}°/{Options.SunElevation:0.##}°" : "") + ")");
+                    $"({string.Join(", ", skyTextures)}) → {SkyboxReconstruction.TextureName}, shader {shaderPath} (" +
+                    (Options.SunIntensity > 0 ? $"sun {Options.SunIntensity:0.##} @ {Options.SunDegrees:0.##}°/{Options.SunElevation:0.##}°" : $"skyLight {Options.SkyLightValue:0.##}") + ")");
             }
 
             // 3. compile targets: original lightmap values at shared world points
@@ -2191,7 +2191,9 @@ namespace JKDecompiler.Core
             res.SkyModelOffset = skyModelOffset;
             Console.Error.WriteLine($"[sky] step correction: {(skySpatial ? "spatial" : "indicator")} model offset={skyModelOffset:F3}/ch" +
                 (skySpatial
-                    ? $" | diagnostic gain={skyGain:F4} offset={skyOffset:F3}/ch — the baked wash at skyLight {Options.SkyLightValue:0.##} needs ×{skyGain:0.##} to match the original (set --sky-value {Options.SkyLightValue * skyGain:0.##})"
+                    ? (Options.SunIntensity > 0
+                        ? $" | diagnostic gain={skyGain:F4} offset={skyOffset:F3}/ch — the baked wash at sun {Options.SunIntensity:0.##} needs ×{skyGain:0.##} to match the original (set --sun-intensity {Options.SunIntensity * skyGain:0.##})"
+                        : $" | diagnostic gain={skyGain:F4} offset={skyOffset:F3}/ch — the baked wash at skyLight {Options.SkyLightValue:0.##} needs ×{skyGain:0.##} to match the original (set --sky-value {Options.SkyLightValue * skyGain:0.##})")
                     : $" | gain={skyGain:F4} offset={skyOffset:F3}/ch"));
 
             // 5b. JOINT non-negative least squares over ALL candidate fields —
