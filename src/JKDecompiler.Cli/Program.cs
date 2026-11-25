@@ -24,12 +24,15 @@ static class RunCli
                 case "convert": return Convert(args);
                 case "convert-dir": return ConvertDir(args);
                 case "recover-lights": return RecoverLights(args);
+                case "fit-lights": return FitLights(args);
                 default: PrintUsage(); return 2;
             }
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"error: {ex.Message}");
+            if (Environment.GetEnvironmentVariable("JKD_TRACE") == "1")
+                Console.Error.WriteLine(ex.StackTrace);
             return 2;
         }
     }
@@ -155,6 +158,23 @@ static class RunCli
         return ok == rs.Count ? 0 : 1;
     }
 
+    /// <summary>
+    /// Positional args (command word removed). Values of known flags must NOT
+    /// leak into the positional list — a bare !StartsWith("--") filter leaves
+    /// them behind and shifts every positional after them (a --seeds value
+    /// lands in the scratch-dir slot, e.g.).
+    /// </summary>
+    static string[] SplitPositional(string[] args, string[] valueFlags)
+    {
+        var pos = new List<string>();
+        for (int i = 1; i < args.Length; i++)
+        {
+            if (valueFlags.Contains(args[i])) { i++; continue; } // skip flag + its value
+            if (!args[i].StartsWith("--")) pos.Add(args[i]);
+        }
+        return pos.ToArray();
+    }
+
     private static int OptI(string[] args, string name, int dflt)
     {
         int i = Array.IndexOf(args, name);
@@ -167,6 +187,70 @@ static class RunCli
         return i >= 0 && i + 1 < args.Length && float.TryParse(args[i + 1], out float v) ? v : dflt;
     }
 
+    private static string OptS(string[] args, string name)
+    {
+        int i = Array.IndexOf(args, name);
+        return i >= 0 && i + 1 < args.Length ? args[i + 1] : "";
+    }
+
+    /// <summary>
+    /// M2.5 stage 2: closed-loop light fit — recover lights (stage 1), then
+    /// re-bake with q3map2 and least-squares fit intensity/color (and positions)
+    /// against the original engine's lightmap blocks. Requires an M2 .map as the
+    /// geometry base: <c>jkdecompiler convert</c> first.
+    /// </summary>
+    private static int FitLights(string[] args)
+    {
+        var pos = SplitPositional(args, new[] { "--max-seeds", "--parallel", "--pos-step", "--lm-size", "--seeds", "--sky-value" });
+        if (pos.Length < 5)
+        {
+            Console.Error.WriteLine("usage: jkdecompiler fit-lights <orig.bsp> <base.map> <q3map2-binary> <game-dir> <outdir> [scratch-dir]");
+            Console.Error.WriteLine("  M2.5 stage 2: closed-loop fit of recovered lights against the baked lightmap");
+            Console.Error.WriteLine("  options: [--max-seeds N] [--seeds FILE] [--parallel N] [--no-posfit] [--no-radfit] [--pos-step F] [--jka-format] [--lm-size N] [--sky-value N]");
+            return 2;
+        }
+        if (!File.Exists(pos[1]))
+        {
+            Console.Error.WriteLine($"base map not found: {pos[1]} — run 'jkdecompiler convert' first");
+            return 2;
+        }
+        var d = new BspReader().Read(pos[0]);
+        string scratch = pos.Length >= 6 ? pos[5] : Path.Combine(pos[4], "scratch");
+        var fit = new LightFit(pos[2], pos[3], new LightFitOptions
+        {
+            MaxSeeds = OptI(args, "--max-seeds", 0),
+            Parallel = OptI(args, "--parallel", 2),
+            PosFit = !args.Any(a => a == "--no-posfit"),
+            RadiusFit = !args.Any(a => a == "--no-radfit"),
+            PosStep = OptF(args, "--pos-step", 8f),
+            WriteJkaFormat = args.Any(a => a == "--jka-format"),
+            LightmapSize = OptI(args, "--lm-size", 128),
+            SkyLightValue = OptF(args, "--sky-value", (float)SkyboxReconstruction.DefaultSkyLightValue),
+            SeedsPath = OptS(args, "--seeds"),
+        });
+        string mapLabel = Path.GetFileNameWithoutExtension(pos[0]);
+        Console.WriteLine($"=> {mapLabel}: fitting lights against baked lightmap blocks ({pos[2]})");
+        var r = fit.Fit(d, pos[1], pos[4], scratch, mapLabel);
+        Console.WriteLine($"  points: {r.MatchedPoints} matched / {r.UnmatchedPoints} unmatched");
+        Console.WriteLine($"  error (area-weighted L1/channel): ambient-only={r.ErrorAmbientOnly:F2}  after fit={r.ErrorStageA:F2}  final={r.ErrorFinal:F2}" +
+            (r.PositionsRolledBack ? "  (positions rolled back)" : ""));
+        var kept = r.Lights.Where(l => l.Kept).ToList();
+        Console.WriteLine($"  lights: kept {kept.Count} / dropped {r.Lights.Count - kept.Count} / compiles {r.CompilesRun} / {r.ElapsedMs / 1000.0:F1}s");
+        foreach (var l in kept)
+            Console.WriteLine($"  kept  {l.Name}: pos=({l.Position.X:0.#} {l.Position.Y:0.#} {l.Position.Z:0.#}) " +
+                $"intensity={l.Intensity:0.#} color=({(int)(l.Color01.R * 255)} {(int)(l.Color01.G * 255)} {(int)(l.Color01.B * 255)}) " +
+                $"contrib={l.ContributionPct:F1}% dE={l.DeltaE:F2} moved={l.PositionMoved}");
+        foreach (var l in r.Lights.Where(l => !l.Kept).Take(10))
+            Console.WriteLine($"  drop  {l.Name}: {l.DropReason}");
+        if (r.Lights.Count(l => !l.Kept) > 10)
+            Console.WriteLine($"  ... and {r.Lights.Count(l => !l.Kept) - 10} more dropped");
+        if (!string.IsNullOrEmpty(r.Note)) Console.WriteLine($"  note: {r.Note}");
+        var arts = new[] { "fit.map", "fit_report.json", "fit_lights_overlay.png" };
+        if (r.DiffWritten) arts = arts.Append("lightmap_diff.png").ToArray();
+        Console.WriteLine($"wrote {string.Join(" + ", arts)} to {Path.GetFullPath(pos[4])}");
+        return r.ErrorFinal < r.ErrorAmbientOnly ? 0 : 1;
+    }
+
     /// <summary>
     /// M2.5 stage 1: grid seeding — recover light candidates from the baked
     /// lightgrid (directions + directed colors), emit target_light/light
@@ -174,7 +258,7 @@ static class RunCli
     /// </summary>
     private static int RecoverLights(string[] args)
     {
-        var pos = args.Where(a => !a.StartsWith("--")).Skip(1).ToArray();
+        var pos = SplitPositional(args, new[] { "--min-cells", "--max-ray-dist", "--directed-min" });
         if (pos.Length < 2)
         {
             Console.Error.WriteLine("usage: jkdecompiler recover-lights <bsp> <outdir> [--min-cells N] [--max-ray-dist F] [--directed-min F]");
@@ -278,6 +362,7 @@ static class RunCli
               jkdecompiler convert <bsp> <q3map2> <out>     M2: q3map2 -convert -> .map + report
               jkdecompiler convert-dir <dir> <q3map2> <out> M2: batch over a .bsp directory
               jkdecompiler recover-lights <bsp> <out>       M2.5s1: recover lights from the lightgrid
+              jkdecompiler fit-lights <bsp> <map> <q3map2> <gamedir> <out> [scratch]  M2.5s2: closed-loop fit vs baked lightmap
             """);
     }
 }

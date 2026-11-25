@@ -139,6 +139,10 @@ namespace JKDecompiler.Core
     {
         public ConvertResult Convert(string bspPath, string q3map2Bin, string outDir, string game = "ja", int timeoutMinutes = 10, bool recompile = false)
         {
+            // The garux fork resolves its VFS base path from the executable
+            // path; a relative binary ("tools/q3map2") dies with
+            // "Failed to find a valid base path" and exit 1.
+            q3map2Bin = Path.GetFullPath(q3map2Bin);
             Directory.CreateDirectory(outDir);
             var stem = Path.GetFileNameWithoutExtension(bspPath);
             var bspInDir = Path.Combine(outDir, Path.GetFileName(bspPath));
@@ -171,6 +175,9 @@ namespace JKDecompiler.Core
                     proc.Kill(entireProcessTree: true);
                     throw new TimeoutException($"q3map2 did not finish in {timeoutMinutes} min for {Path.GetFileName(bspPath)}");
                 }
+                // Parameterless WaitForExit() flushes the async output events;
+                // without it the redirect log is silently empty/short.
+                proc.WaitForExit();
                 exitCode = proc.ExitCode;
                 sw.Stop();
             }
@@ -283,6 +290,7 @@ namespace JKDecompiler.Core
         /// <summary>Compile the generated .map back to a BSP as a validity check.</summary>
         public static Dictionary<string, object?> RunRecompile(string q3map2Bin, string mapFile, string game, string outDir, int timeoutMinutes)
         {
+            q3map2Bin = Path.GetFullPath(q3map2Bin); // see Convert()
             var sw = System.Diagnostics.Stopwatch.StartNew();
             var log = new System.Text.StringBuilder();
             int exitCode;
@@ -309,6 +317,7 @@ namespace JKDecompiler.Core
                     proc.Kill(entireProcessTree: true);
                     throw new TimeoutException($"recompile did not finish in {timeoutMinutes} min for {Path.GetFileName(mapFile)}");
                 }
+                proc.WaitForExit(); // flush async output events (see Convert)
                 exitCode = proc.ExitCode;
                 sw.Stop();
             }
