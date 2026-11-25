@@ -61,23 +61,39 @@ public static class SkyboxReconstruction
     public const double DefaultSkyLightValue = 130;
 
     /// <summary>
-    /// Overlay shader installed into the game VFS. q3map_skyLight auto-applies
-    /// the sky surfaceparm (required for ELightType::Sun tracing); the trailing
-    /// sample_color flag makes the light stage sample the skyParms image for
-    /// per-angle color, matching the original JKA skybox bake.
+    /// Overlay shader source. When <paramref name="sunIntensity"/> &gt; 0, the
+    /// shader also carries a <c>sun</c> key — the game's own directional wash
+    /// (q3map_sun <red> <green> <blue> <intensity> <degrees> <elevation>;
+    /// degree 0 = from the east, 90 = north, altitude 0 = horizon/90 = noon).
+    /// The single q3map_skyLight value is radially symmetric; the directional
+    /// key is what lets the baked wash match the original's south-strong /
+    /// north-weak shape. Intensity 0 (the default) emits no sun key — identical
+    /// to the single-value overlay.
     /// </summary>
-    private static string ShaderSource(string texture, string imageBase, double skyLightValue) => $$"""
-        textures/{{texture}}
+    private static string ShaderSource(string texture, string imageBase, double skyLightValue,
+        double sunIntensity = 0, double sunDegrees = 120, double sunElevation = 40,
+        double sunR = 1.0, double sunG = 0.54, double sunB = 0.629)
+    {
+        string text = $$"""
+            textures/{{texture}}
+            {
+                qer_editorimage    textures/skies/sky.tga
+                surfaceparm        noimpact
+                surfaceparm        nomarks
+                notc
+                q3map_nolightmap
+                skyParms           {{imageBase}} 512 -
+                q3map_skyLight     {{skyLightValue:0.##}} 16 -90 90 1
+            }
+            """;
+        if (sunIntensity > 0)
         {
-            qer_editorimage    textures/skies/sky.tga
-            surfaceparm        noimpact
-            surfaceparm        nomarks
-            notc
-            q3map_nolightmap
-            skyParms           {{imageBase}} 512 -
-            q3map_skyLight     {{skyLightValue:0.##}} 16 -90 90 1
+            string sun = $"    sun {sunR:0.000} {sunG:0.000} {sunB:0.000} {sunIntensity:0.##} {sunDegrees:0.##} {sunElevation:0.##}";
+            int close = text.LastIndexOf('}');
+            text = text.Substring(0, close) + sun + "\n" + text.Substring(close);
         }
-        """;
+        return text;
+    }
 
     /// <summary>
     /// The map-form names of the sky-flagged textures used by world brush
@@ -173,12 +189,15 @@ public static class SkyboxReconstruction
     /// is the wash-magnitude calibration knob).
     /// </summary>
     public static string InstallShader(string gameDir, string imageBase,
-        double skyLightValue = DefaultSkyLightValue)
+        double skyLightValue = DefaultSkyLightValue,
+        double sunIntensity = 0, double sunDegrees = 120, double sunElevation = 40,
+        double sunR = 1.0, double sunG = 0.54, double sunB = 0.629)
     {
         string dir = Path.Combine(gameDir, "base", "shaders");
         Directory.CreateDirectory(dir);
         string path = Path.Combine(dir, ShaderFileName);
-        string text = ShaderSource(TextureName, imageBase, skyLightValue);
+        string text = ShaderSource(TextureName, imageBase, skyLightValue,
+            sunIntensity, sunDegrees, sunElevation, sunR, sunG, sunB);
         if (!File.Exists(path) || File.ReadAllText(path) != text)
             File.WriteAllText(path, text);
         return path;

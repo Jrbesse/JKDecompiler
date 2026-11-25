@@ -74,6 +74,12 @@ namespace JKDecompiler.Core
         public bool WriteJkaFormat = false; // emit 4-value JKA "light" L R G B keys instead of Q3 light+_color
         /// <summary>q3map_skyLight value for the fit/sky overlay — the sky-wash magnitude knob.</summary>
         public double SkyLightValue = SkyboxReconstruction.DefaultSkyLightValue;
+        /// <summary>Directional sun intensity for the fit/sky overlay (0 = no sun key — back-compat).</summary>
+        public double SunIntensity = 0;
+        /// <summary>Sun azimuth in degrees — 0 = from the east, 90 = north (JKA convention).</summary>
+        public double SunDegrees = 120;
+        /// <summary>Sun elevation in degrees — 0 = horizon, 90 = noon.</summary>
+        public double SunElevation = 40;
     }
 
     public class LightFitResult
@@ -1831,9 +1837,11 @@ namespace JKDecompiler.Core
             {
                 (baseText, skyRetextured) = SkyboxReconstruction.RetextureSky(strippedText, skyTextures);
                 string shaderPath = SkyboxReconstruction.InstallShader(GameDir,
-                    SkyboxReconstruction.SkyImageBase(origBsp), Options.SkyLightValue);
+                    SkyboxReconstruction.SkyImageBase(origBsp), Options.SkyLightValue,
+                    Options.SunIntensity, Options.SunDegrees, Options.SunElevation);
                 Console.Error.WriteLine($"[sky] re-textured {skyRetextured} sky sides " +
-                    $"({string.Join(", ", skyTextures)}) → {SkyboxReconstruction.TextureName}, shader {shaderPath} (skyLight {Options.SkyLightValue:0.##})");
+                    $"({string.Join(", ", skyTextures)}) → {SkyboxReconstruction.TextureName}, shader {shaderPath} (skyLight {Options.SkyLightValue:0.##}" +
+                    (Options.SunIntensity > 0 ? $", sun {Options.SunIntensity:0.##} @ {Options.SunDegrees:0.##}°/{Options.SunElevation:0.##}°" : "") + ")");
             }
 
             // 3. compile targets: original lightmap values at shared world points

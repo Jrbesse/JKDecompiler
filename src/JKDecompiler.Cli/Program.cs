@@ -201,12 +201,12 @@ static class RunCli
     /// </summary>
     private static int FitLights(string[] args)
     {
-        var pos = SplitPositional(args, new[] { "--max-seeds", "--parallel", "--pos-step", "--lm-size", "--seeds", "--sky-value" });
+        var pos = SplitPositional(args, new[] { "--max-seeds", "--parallel", "--pos-step", "--lm-size", "--seeds", "--sky-value", "--sun-intensity", "--sun-degrees", "--sun-elevation" });
         if (pos.Length < 5)
         {
             Console.Error.WriteLine("usage: jkdecompiler fit-lights <orig.bsp> <base.map> <q3map2-binary> <game-dir> <outdir> [scratch-dir]");
             Console.Error.WriteLine("  M2.5 stage 2: closed-loop fit of recovered lights against the baked lightmap");
-            Console.Error.WriteLine("  options: [--max-seeds N] [--seeds FILE] [--parallel N] [--no-posfit] [--no-radfit] [--pos-step F] [--jka-format] [--lm-size N] [--sky-value N]");
+            Console.Error.WriteLine("  options: [--max-seeds N] [--seeds FILE] [--parallel N] [--no-posfit] [--no-radfit] [--pos-step F] [--jka-format] [--lm-size N] [--sky-value N] [--sun-intensity N] [--sun-degrees F] [--sun-elevation F]");
             return 2;
         }
         if (!File.Exists(pos[1]))
@@ -226,6 +226,9 @@ static class RunCli
             WriteJkaFormat = args.Any(a => a == "--jka-format"),
             LightmapSize = OptI(args, "--lm-size", 128),
             SkyLightValue = OptF(args, "--sky-value", (float)SkyboxReconstruction.DefaultSkyLightValue),
+            SunIntensity = OptF(args, "--sun-intensity", 0f),
+            SunDegrees = OptF(args, "--sun-degrees", 120f),
+            SunElevation = OptF(args, "--sun-elevation", 40f),
             SeedsPath = OptS(args, "--seeds"),
         });
         string mapLabel = Path.GetFileNameWithoutExtension(pos[0]);
