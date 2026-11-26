@@ -322,7 +322,9 @@ namespace JKDecompiler.Core
         }
 
         /// <summary>Strip split: split a cluster's core along its major axis at the
-        /// median when extent &gt; StripMinExtent AND aspect &gt; StripMinAspect.</summary>
+        /// widest inter-core gap (not the median — median splits thin strips into
+        /// halves with &lt; MIN_CORE core texels and drops the whole band) when
+        /// extent &gt; StripMinExtent AND aspect &gt; StripMinAspect.</summary>
         private static void splitCluster(List<ClusterPoint> pts, string tag, int depth,
             List<(List<ClusterPoint>, string)> outList)
         {
@@ -338,15 +340,32 @@ namespace JKDecompiler.Core
             if (se0 > StripMinExtent && se0 > StripMinAspect * Math.Max(50.0, se1))
             {
                 int axis = ext[0].index;
-                double med = core.Select(p => p.World[axis]).OrderBy(v => v).ElementAt(core.Count / 2);
-                var a = pts.Where(p => p.World[axis] <= med).ToList();
-                var b = pts.Where(p => p.World[axis] > med).ToList();
-                int coreA = a.Count(p => p.B >= T_CORE);
-                int coreB = b.Count(p => p.B >= T_CORE);
-                if (coreA >= MIN_CORE) splitCluster(a, tag + "a", depth + 1, outList);
-                if (coreB >= MIN_CORE) splitCluster(b, tag + "b", depth + 1, outList);
-                if (coreA < MIN_CORE && coreB < MIN_CORE) outList.Add((pts, tag));
-                return;
+                var sorted = core.OrderBy(p => p.World[axis]).ToList();
+                double span = sorted.Last().World[axis] - sorted.First().World[axis];
+                double meanGap = span / Math.Max(1, sorted.Count - 1);
+                int bestIdx = -1; double bestGap = -1.0;
+                for (int i = 0; i + 1 < sorted.Count; i++)
+                {
+                    int coreA = i + 1; int coreB = sorted.Count - (i + 1);
+                    if (coreA < MIN_CORE || coreB < MIN_CORE) continue;
+                    double gap = sorted[i + 1].World[axis] - sorted[i].World[axis];
+                    if (gap > bestGap) { bestGap = gap; bestIdx = i; }
+                }
+                if (bestIdx >= 0 && bestGap > Math.Max(2.0 * meanGap, 150.0))
+                {
+                    double splitAt = (sorted[bestIdx].World[axis] + sorted[bestIdx + 1].World[axis]) / 2.0;
+                    var a = pts.Where(p => p.World[axis] <= splitAt).ToList();
+                    var b = pts.Where(p => p.World[axis] > splitAt).ToList();
+                    if (a.Count(p => p.B >= T_CORE) >= MIN_CORE)
+                        splitCluster(a, tag + "a", depth + 1, outList);
+                    else
+                        outList.Add((a, tag + "a"));
+                    if (b.Count(p => p.B >= T_CORE) >= MIN_CORE)
+                        splitCluster(b, tag + "b", depth + 1, outList);
+                    else
+                        outList.Add((b, tag + "b"));
+                    return;
+                }
             }
             outList.Add((pts, tag));
         }
@@ -460,11 +479,25 @@ namespace JKDecompiler.Core
                     (ext: core.Max(p => p.World.Y) - core.Min(p => p.World.Y), axis: 1),
                     (ext: core.Max(p => p.World.Z) - core.Min(p => p.World.Z), axis: 2),
                 }.OrderByDescending(e => e.ext).First();
-                double med = core.Select(p => p.World[ext.axis]).OrderBy(v => v).ElementAt(core.Count / 2);
-                var a = pts.Where(p => p.World[ext.axis] <= med).ToList();
-                var b = pts.Where(p => p.World[ext.axis] > med).ToList();
-                if (a.Count(p => p.B >= T_CORE) >= MIN_CORE) return FitCluster(a, tag + "a");
-                if (b.Count(p => p.B >= T_CORE) >= MIN_CORE) return FitCluster(b, tag + "b");
+                var sortedCore = core.OrderBy(p => p.World[ext.axis]).ToList();
+                double span = sortedCore.Last().World[ext.axis] - sortedCore.First().World[ext.axis];
+                double meanGap = span / Math.Max(1, sortedCore.Count - 1);
+                int bestIdx = -1; double bestGap = -1.0;
+                for (int i = 0; i + 1 < sortedCore.Count; i++)
+                {
+                    int coreA = i + 1; int coreB = sortedCore.Count - (i + 1);
+                    if (coreA < MIN_CORE || coreB < MIN_CORE) continue;
+                    double gap = sortedCore[i + 1].World[ext.axis] - sortedCore[i].World[ext.axis];
+                    if (gap > bestGap) { bestGap = gap; bestIdx = i; }
+                }
+                if (bestIdx >= 0 && bestGap > Math.Max(2.0 * meanGap, 150.0))
+                {
+                    double splitAt = (sortedCore[bestIdx].World[ext.axis] + sortedCore[bestIdx + 1].World[ext.axis]) / 2.0;
+                    var a = pts.Where(p => p.World[ext.axis] <= splitAt).ToList();
+                    var b = pts.Where(p => p.World[ext.axis] > splitAt).ToList();
+                    if (a.Count(p => p.B >= T_CORE) >= MIN_CORE) return FitCluster(a, tag + "a");
+                    if (b.Count(p => p.B >= T_CORE) >= MIN_CORE) return FitCluster(b, tag + "b");
+                }
             }
             return null;
         }
