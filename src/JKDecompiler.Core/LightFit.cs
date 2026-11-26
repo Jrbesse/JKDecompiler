@@ -59,6 +59,8 @@ namespace JKDecompiler.Core
         public int MaxSeeds = 0;          // 0 = all accepted stage-1 seeds
         public float MergeDistance = 32f; // merge stage-1 seeds closer than this (0 = off)
         public string SeedsPath = "";     // external seeds JSON {seeds:[{name,position,color,level,radius,style}]} — skips stage 1
+        public bool UseGridStage1 = false; // opt back INTO stage-1 grid recovery (the default is the
+                                           // lightmap-derived generator — see LightmapSeedGenerator)
         public bool PosFit = true;        // analytic position refinement after the linear fit
         public bool RadiusFit = true;     // per-light radius hill-climb (JKA quadratic falloff)
         public float PosStep = 8f;        // first hill-climb step (world units); second round = step/2
@@ -1676,7 +1678,26 @@ namespace JKDecompiler.Core
             // 1. seeds — either external (lightmap-derived; stage 1's grid
             // ray-triangulation lands 300-1300u off the true light positions,
             // which the lightmap — the fit's ground truth — places on the
-            // floor/wall peaks) or from stage-1 grid recovery.
+            // floor/wall peaks) or from stage-1 grid recovery. The DEFAULT path
+            // (no --seeds, no --stage1) derives lightmap-derived seeds in-memory
+            // and feeds them through the same external-loader code (solid pushes,
+            // normal handling); stage-1 grid recovery is opt-in via --stage1.
+            if (string.IsNullOrEmpty(Options.SeedsPath) && !Options.UseGridStage1)
+            {
+                var gen = LightmapSeedGenerator.Generate(origBsp);
+                if (gen.Count > 0)
+                {
+                    string genPath = System.IO.Path.Combine(outDir, "seeds.generated.json");
+                    LightmapSeedGenerator.WriteJson(gen, mapLabel, genPath);
+                    Console.Error.WriteLine($"[seeds] lightmap-derived default: {gen.Count} seeds → {genPath}");
+                    Options.SeedsPath = genPath;
+                }
+                else
+                {
+                    Console.Error.WriteLine("[seeds] lightmap-derived generator found 0 pools — falling back to stage-1 grid recovery");
+                    Options.UseGridStage1 = true;
+                }
+            }
             var lights = new List<FitLight>();
             if (!string.IsNullOrEmpty(Options.SeedsPath))
             {
@@ -1763,7 +1784,7 @@ namespace JKDecompiler.Core
                 }
                 Console.Error.WriteLine($"[seeds] external: {lights.Count} from {Options.SeedsPath}");
             }
-            else
+            else if (Options.UseGridStage1)
             {
                 var lr = new LightRecovery();
                 var lrRes = lr.Recover(origBsp);
