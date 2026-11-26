@@ -12,43 +12,53 @@ namespace JKDecompiler.Core
     ///
     /// Stage-1 grid recovery (<see cref="LightRecovery"/>) is positionally wrong
     /// for the fit — grid seeds land 300–1300u off the true light positions, so
-    /// the per-light gate drops them all (kept=0 on academy1). The fit's ground
-    /// truth is the baked lightmap, so the default seed path derives seeds from
-    /// it directly: per lit face, the bright texel clusters in the face's
-    /// lightmap footprint are the pools of one physical light. Per pool, the
-    /// 1D brightness profile along the pool's major axis is fit against the
-    /// on-surface JKA falloff model
-    ///     b(d) = floor + L · max(0, 1 - (d²+h²)/r²), d ≤ √(r²-h²)
-    /// (h = apex height above the surface, r = radius, L = intensity) by grid
-    /// search over (h, r), emitting the fitted apex at the pool centroid +
-    /// normal·h. The fit refits intensity/color/radius per light, so the
-    /// emitted values are starting points, not answers.
+    /// the per-light gate drops them all. The fit's ground truth is the baked
+    /// lightmap, so the default seed path derives seeds from it directly:
+    ///
+    ///   1. per lit face, texels with mean-RGB &gt; T_BRIGHT form 8-connected
+    ///      components (≥ COMP_MIN texels) — one component is one physical pool;
+    ///   2. component centroids within CLUSTER_DIST merge into one cluster
+    ///      (corners merge — floors well apart stay separate);
+    ///   3. per cluster, the geometry is fitted against the on-surface JKA
+    ///      falloff model b(d) = floor + L·max(0, 1 − (d/R)²) by coordinate
+    ///      descent over (x, y, z, R): L solved in closed form per (x,y,z,R),
+    ///      L1 objective over the bright texels + same-face dim tails (which
+    ///      only constrain R from below);
+    ///   4. long multi-pool strips are split along their major axis before the
+    ///      fit (extent &gt; StripMinExtent AND aspect &gt; StripMinAspect), and
+    ///      a post-fit split fires when the core corr is too weak;
+    ///   5. seeds are deduped by 0.6·min(radius) separation.
     ///
     /// Emission format is the same JSON the external <c>--seeds</c> loader
     /// consumes: <c>{map, source, seeds:[{name, position, color, level, radius, style, normal}]}</c>.
     /// </summary>
     public static class LightmapSeedGenerator
     {
-        /// <summary>Fixed apex height as the fallback when the (L,h,r) fit has
-        /// nothing to latch onto.</summary>
-        public const double Height = 128.0;
-
-        /// <summary>Minimum texels in a bright cluster to count as a pool.</summary>
-        public const int MinPoolTexels = 4;
-
-        /// <summary>Maximum pools emitted (per map) — well-separated means the
-        /// per-light fields are distinct bases, so ten is plenty for a fit.</summary>
-        public const int MaxSeeds = 10;
-
-        /// <summary>Minimum separation between kept seeds (world units). Within
-        /// this distance the fields are near-collinear (same pool seen from two
-        /// adjacent faces), which is what broke multi-light selection in v40.</summary>
-        public const double MinSpacing = 1000.0;
-
-        /// <summary>Hard cap on the fitted radius — pools don't extend past
-        /// room-scale falloff; 4096u would wash the whole map and drown the
-        /// real pool shape in the model.</summary>
-        public const double MaxRadius = 2048.0;
+        /// <summary>Bright-texel threshold (mean RGB). Pools start at ≥ 8.</summary>
+        public const double T_BRIGHT = 8.0;
+        /// <summary>Core-texel threshold (mean RGB) — the points that drive the corr gate.</summary>
+        public const double T_CORE = 50.0;
+        /// <summary>Minimum bright texels per component to count as a pool.</summary>
+        public const int COMP_MIN = 30;
+        /// <summary>Cross-face clustering distance (world units).</summary>
+        public const double CLUSTER_DIST = 60.0;
+        /// <summary>Minimum core texels for a usable fit.</summary>
+        public const int MIN_CORE = 25;
+        /// <summary>Strip split: extent beyond this AND aspect beyond this → split.</summary>
+        public const double StripMinExtent = 500.0;
+        public const double StripMinAspect = 2.5;
+        /// <summary>Max seeds emitted.</summary>
+        public const int MaxSeeds = 20;
+        /// <summary>Min core corr to keep a seed.</summary>
+        public const double KeepCorr = 0.65;
+        /// <summary>Min fitted intensity to keep a seed.</summary>
+        public const double KeepL = 30.0;
+        /// <summary>Initial apex offset along the face normal (descent moves it).</summary>
+        public const double InitHeight = 60.0;
+        /// <summary>Max fit radius (world units).</summary>
+        public const double MaxRadius = 1200.0;
+        /// <summary>Min fit radius (world units).</summary>
+        public const double MinRadius = 128.0;
 
         public class GeneratedSeed
         {
@@ -61,6 +71,33 @@ namespace JKDecompiler.Core
             public Vector3 Normal = Vector3.Zero;   // apex normal (for in-solid pushes)
         }
 
+        private class FaceData
+        {
+            public int FaceIndex;
+            public Vector3 Normal = Vector3.Zero;
+            public Dictionary<(int Tx, int Ty), double> Bright = new();
+            public Dictionary<(int Tx, int Ty), Vector3> World = new();
+            public Dictionary<(int Tx, int Ty), Vector3> Rgb = new();
+        }
+
+        private class Component
+        {
+            public List<(int Tx, int Ty)> Texels = new();
+            public List<(int Tx, int Ty)> DimTail = new();
+            public int FaceIndex;
+            public Vector3 Centroid = Vector3.Zero;
+        }
+
+        private class ClusterPoint
+        {
+            public readonly Vector3 World;
+            public readonly double B;
+            public readonly Vector3 Rgb;
+            public readonly Vector3 FaceNormal;
+            public ClusterPoint(Vector3 world, double b, Vector3 rgb, Vector3 faceNormal)
+            { World = world; B = b; Rgb = rgb; FaceNormal = faceNormal; }
+        }
+
         /// <summary>
         /// Derive candidate lights from the baked lightmap blocks.
         /// </summary>
@@ -70,17 +107,17 @@ namespace JKDecompiler.Core
             var faces = LightFit.BuildSampleFaces(d);
             const int FaceWidth = 128;
 
+            // ---- 1. per-face bright texel collection ----
+            var faceData = new List<FaceData>();
             foreach (var sf in faces)
             {
                 if (sf.Hull2D.Length < 3) continue;
-                // Skip sky faces — they carry the sky wash, never a physical light
-                // pool (the fit re-bakes the sky separately via SkyboxReconstruction).
                 var fDef = d.Faces[sf.FaceIndex];
                 var shaderName = fDef.ShaderIndex >= 0 && fDef.ShaderIndex < d.Shaders.Count
                     ? d.Shaders[fDef.ShaderIndex].Name ?? ""
                     : "";
                 if (shaderName.Contains("sky", StringComparison.OrdinalIgnoreCase)) continue;
-                if (sf.UMax - sf.UMin < 0.02 && sf.VMax - sf.VMin < 0.02) continue; // sub-pixel box
+                if (sf.UMax - sf.UMin < 0.02 && sf.VMax - sf.VMin < 0.02) continue;
                 if (sf.Block < 0 || sf.Block >= d.Lightmaps.Count) continue;
                 var block = d.Lightmaps[sf.Block];
                 if (block == null) continue;
@@ -90,8 +127,8 @@ namespace JKDecompiler.Core
                 var o = sf.FrameOrigin; var fu = sf.FrameU; var fv = sf.FrameV;
                 var au = sf.AffineU; var av = sf.AffineV;
                 if (au.Length < 4 || av.Length < 4) continue;
-                if (Math.Abs(au[3]) > 1e8 || Math.Abs(av[3]) > 1e8) continue; // unusable sentinel
-                // au = [a0, a1, 0, c]: U = a0*x + a1*y + c ; av = [b0, b1, 0, f]
+                if (Math.Abs(au[3]) > 1e8 || Math.Abs(av[3]) > 1e8) continue;
+
                 double det = au[0] * av[1] - au[1] * av[0];
                 if (Math.Abs(det) < 1e-12) continue;
                 double invDet = 1.0 / det;
@@ -104,80 +141,15 @@ namespace JKDecompiler.Core
 
                 Vector3 WorldFromUv(double u, double v)
                 {
-                    double x = ( (u - au[3]) * av[1] - (v - av[3]) * au[1] ) * invDet;
-                    double y = ( (v - av[3]) * au[0] - (u - au[3]) * av[0] ) * invDet;
+                    double x = ((u - au[3]) * av[1] - (v - av[3]) * au[1]) * invDet;
+                    double y = ((v - av[3]) * au[0] - (u - au[3]) * av[0]) * invDet;
                     return new Vector3(
                         (float)(o.X + fu.X * x + fv.X * y),
                         (float)(o.Y + fu.Y * x + fv.Y * y),
                         (float)(o.Z + fu.Z * x + fv.Z * y));
                 }
 
-                // per-texel brightness (mean RGB), inside the hull only
-                int w = tx1 - tx0 + 1, h = ty1 - ty0 + 1;
-                var bright = new double[w, h];
-                var collected = new bool[w, h];
-                var texels = new List<(int tx, int ty, double b)>();
-                double bmax = 0;
-                for (int ty = ty0; ty <= ty1; ty++)
-                {
-                    for (int tx = tx0; tx <= tx1; tx++)
-                    {
-                        double u = (tx + 0.5) / FaceWidth;
-                        double v = (ty + 0.5) / FaceWidth;
-                        double x = ( (u - au[3]) * av[1] - (v - av[3]) * au[1] ) * invDet;
-                        double y = ( (v - av[3]) * au[0] - (u - au[3]) * av[0] ) * invDet;
-                        if (!LightFit.PointInHull(sf.Hull2D, x, y, 1.0)) continue;
-                        int idx = (ty * FaceWidth + tx) * 3;
-                        if (idx + 2 >= data.Length) continue;
-                        double b = (data[idx] + data[idx + 1] + data[idx + 2]) / 3.0;
-                        bright[tx - tx0, ty - ty0] = b;
-                        collected[tx - tx0, ty - ty0] = true;
-                        texels.Add((tx, ty, b));
-                        if (b > bmax) bmax = b;
-                    }
-                }
-                if (texels.Count < MinPoolTexels) continue;
-
-                double median = texels.Select(t => t.b).OrderBy(z => z).ElementAt(texels.Count / 2);
-                double dynamicRange = bmax - median;
-                if (dynamicRange < 12.0) continue; // no significant pool on this face
-                double threshold = median + 0.30 * dynamicRange;
-
-                // connected components over threshold texels (8-connectivity)
-                var visited = new bool[w, h];
-                var pools = new List<(List<(int tx, int ty, double b)> texels, double peak, int peakTx, int peakTy)>();
-                for (int ty = 0; ty < h; ty++)
-                for (int tx = 0; tx < w; tx++)
-                {
-                    if (!collected[tx, ty] || visited[tx, ty]) continue;
-                    if (bright[tx, ty] < threshold) continue;
-                    var stack = new Stack<(int x, int y)>();
-                    stack.Push((tx, ty)); visited[tx, ty] = true;
-                    var pool = new List<(int tx, int ty, double b)>();
-                    while (stack.Count > 0)
-                    {
-                        var (cx, cy) = stack.Pop();
-                        pool.Add((tx0 + cx, ty0 + cy, bright[cx, cy]));
-                        for (int dy = -1; dy <= 1; dy++)
-                        for (int dx = -1; dx <= 1; dx++)
-                        {
-                            if (dx == 0 && dy == 0) continue;
-                            int nx = cx + dx, ny = cy + dy;
-                            if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
-                            if (!collected[nx, ny] || visited[nx, ny]) continue;
-                            if (bright[nx, ny] < threshold) continue;
-                            visited[nx, ny] = true;
-                            stack.Push((nx, ny));
-                        }
-                    }
-                    if (pool.Count < MinPoolTexels) continue;
-                    var peak = pool.MaxBy(p => p.b);
-                    pools.Add((pool, peak.b, peak.tx, peak.ty));
-                }
-                if (pools.Count == 0) continue;
-
-                // apex normal: average of stored vertex normals (authoritative),
-                // falling back to the cross-product normal.
+                // stored vertex normal average (authoritative), fallback cross product
                 var f = d.Faces[sf.FaceIndex];
                 Vector3 n = Vector3.Zero; int nUsed = 0;
                 for (int v = 0; v < f.NumVertices; v++)
@@ -185,130 +157,349 @@ namespace JKDecompiler.Core
                     var idx = f.FirstVertexIndex + v;
                     if (idx < 0 || idx >= d.Vertices.Count) continue;
                     var vn = d.Vertices[idx].Normal;
-                    if (vn.LengthSquared() < 0.25f) continue; // degenerate stored normal
+                    if (vn.LengthSquared() < 0.25f) continue;
                     n += vn; nUsed++;
                 }
                 if (nUsed > 0) n = Vector3.Normalize(n);
                 else n = Vector3.Normalize(new Vector3((float)sf.Normal.X, (float)sf.Normal.Y, (float)sf.Normal.Z));
 
-                double floor = median;
-                foreach (var (pool, peakB, peakTx, peakTy) in pools)
+                var fd = new FaceData { FaceIndex = sf.FaceIndex, Normal = n };
+                for (int ty = ty0; ty <= ty1; ty++)
+                for (int tx = tx0; tx <= tx1; tx++)
                 {
-                    if (pool.Count < 8) continue; // need enough points for a profile fit
+                    double u = (tx + 0.5) / FaceWidth;
+                    double v = (ty + 0.5) / FaceWidth;
+                    double x = ((u - au[3]) * av[1] - (v - av[3]) * au[1]) * invDet;
+                    double y = ((v - av[3]) * au[0] - (u - au[3]) * av[0]) * invDet;
+                    if (!LightFit.PointInHull(sf.Hull2D, x, y, 1.0)) continue;
+                    int idx = (ty * FaceWidth + tx) * 3;
+                    if (idx + 2 >= data.Length) continue;
+                    double b = (data[idx] + data[idx + 1] + data[idx + 2]) / 3.0;
+                    fd.Bright[(tx, ty)] = b;
+                    fd.World[(tx, ty)] = WorldFromUv(u, v);
+                    fd.Rgb[(tx, ty)] = new Vector3(data[idx], data[idx + 1], data[idx + 2]);
+                }
+                if (fd.Bright.Count < 2) continue;
+                faceData.Add(fd);
+            }
 
-                    // world positions of pool texels
-                    var pts = pool.Select(p => WorldFromUv((p.tx + 0.5) / FaceWidth, (p.ty + 0.5) / FaceWidth)).ToArray();
-                    var centroid = pts.Aggregate(Vector3.Zero, (a, b) => a + b) / pts.Length;
+            if (faceData.Count == 0) return seeds;
 
-                    // 1D profile along the pool's major axis (2D local frame)
-                    Vector2 LocalXY(Vector3 w)
-                    {
-                        double dx = w.X - o.X, dy = w.Y - o.Y, dz = w.Z - o.Z;
-                        return new Vector2(
-                            (float)(dx * fu.X + dy * fu.Y + dz * fu.Z),
-                            (float)(dx * fv.X + dy * fv.Y + dz * fv.Z));
-                    }
-                    var local = pts.Select(LocalXY).ToArray();
-                    var localCentroid = LocalXY(centroid);
-                    double xx = 0, yy = 0, xy = 0;
-                    foreach (var lp in local)
-                    {
-                        double dX = lp.X - localCentroid.X, dY = lp.Y - localCentroid.Y;
-                        xx += dX * dX; yy += dY * dY; xy += dX * dY;
-                    }
-                    xx /= local.Length; yy /= local.Length; xy /= local.Length;
-                    double tr = xx + yy, det2 = xx * yy - xy * xy;
-                    if (tr < 1e-6) continue;
-                    double disc = Math.Sqrt(Math.Max(0.0, tr * tr / 4 - det2));
-                    double lambda = tr / 2 + disc;
-                    double theta = Math.Atan2(lambda - xx, xy);
-                    var axis = new Vector2((float)Math.Cos(theta), (float)Math.Sin(theta));
-                    var profile = new List<(double s, double b, int tx, int ty)>();
-                    for (int i = 0; i < pts.Length; i++)
-                    {
-                        double s = (local[i].X - localCentroid.X) * axis.X + (local[i].Y - localCentroid.Y) * axis.Y;
-                        profile.Add((s, pool[i].b, pool[i].tx, pool[i].ty));
-                    }
+            // ---- 2. per-face 8-connected components (bright texels ≥ T_BRIGHT) ----
+            var allComponents = new List<Component>();
+            foreach (var fd in faceData)
+            {
+                var bright = new Dictionary<(int, int), double>();
+                foreach (var kv in fd.Bright)
+                    if (kv.Value > T_BRIGHT) bright[kv.Key] = kv.Value;
+                if (bright.Count < COMP_MIN) continue;
 
-                    // grid search (h, r); L solved in closed form per (h, r)
-                    double bestSse = double.MaxValue, bestH = 128.0, bestR = 1024.0, bestL = 1.0;
-                    foreach (var hh in new[] { 0.0, 32.0, 64.0, 128.0, 192.0, 256.0, 384.0, 512.0 })
+                var visited = new HashSet<(int, int)>();
+                foreach (var k in bright.Keys.ToList())
+                {
+                    if (visited.Contains(k)) continue;
+                    var stack = new Stack<(int, int)>();
+                    stack.Push(k); visited.Add(k);
+                    var comp = new Component { FaceIndex = fd.FaceIndex };
+                    while (stack.Count > 0)
                     {
-                        foreach (var rr in new[] { 128.0, 256.0, 512.0, 1024.0, 1536.0, 2048.0, 3072.0, 4096.0 })
+                        var (cx, cy) = stack.Pop();
+                        comp.Texels.Add((cx, cy));
+                        for (int dy = -1; dy <= 1; dy++)
+                        for (int dx = -1; dx <= 1; dx++)
                         {
-                            if (rr <= hh + 32.0) continue;
-                            double sumNum = 0, sumDen = 0;
-                            foreach (var (s, b, tx, ty) in profile)
-                            {
-                                double inv = 1.0 - (s * s + hh * hh) / (rr * rr);
-                                if (inv <= 0) continue;
-                                sumNum += inv * (b - floor);
-                                sumDen += inv * inv;
-                            }
-                            if (sumDen <= 1e-9) continue;
-                            double L = sumNum / sumDen;
-                            double sse = 0;
-                            foreach (var (s, b, tx, ty) in profile)
-                            {
-                                double inv = 1.0 - (s * s + hh * hh) / (rr * rr);
-                                if (inv < 0) inv = 0;
-                                double pred = floor + L * inv;
-                                double res = b - pred;
-                                sse += res * res;
-                            }
-                            if (sse < bestSse) { bestSse = sse; bestH = hh; bestR = rr; bestL = L; }
+                            if (dx == 0 && dy == 0) continue;
+                            var nk = (cx + dx, cy + dy);
+                            if (!bright.ContainsKey(nk) || visited.Contains(nk)) continue;
+                            visited.Add(nk);
+                            stack.Push(nk);
                         }
                     }
-                    double fittedH = Math.Clamp(bestH, 32.0, 512.0);
-                    double fittedR = Math.Min(MaxRadius, Math.Max(bestR, fittedH + 32.0));
+                    if (comp.Texels.Count < COMP_MIN) continue;
 
-                    // color from the top-5% bright texels in the pool
-                    int topN = Math.Max(1, pool.Count / 20);
-                    var top = pool.OrderByDescending(p => p.b).Take(topN).ToArray();
-                    double cr = 0, cg = 0, cb = 0;
-                    foreach (var (tx, ty, b) in top)
+                    // dim tail: same-face dim texels within 2 texels (dim = ≤ T_BRIGHT)
+                    var tailSet = new HashSet<(int, int)>();
+                    foreach (var (tx, ty) in comp.Texels)
+                    for (int dx = -2; dx <= 2; dx++)
+                    for (int dy = -2; dy <= 2; dy++)
                     {
-                        int i = (ty * FaceWidth + tx) * 3;
-                        if (i + 2 < data.Length)
-                        {
-                            cr += data[i]; cg += data[i + 1]; cb += data[i + 2];
-                        }
+                        if (dx == 0 && dy == 0) continue;
+                        var nk = (tx + dx, ty + dy);
+                        if (fd.Bright.TryGetValue(nk, out var db) && db <= T_BRIGHT && tailSet.Add(nk))
+                            comp.DimTail.Add(nk);
                     }
-                    double cnt = Math.Max(1, top.Length);
-                    cr /= cnt; cg /= cnt; cb /= cnt;
 
-                    var apex = centroid + n * (float)fittedH;
-                    seeds.Add(new GeneratedSeed
+                    double ccx = 0, ccy = 0, ccz = 0;
+                    foreach (var (tx, ty) in comp.Texels)
                     {
-                        Name = $"lm_{seeds.Count}",
-                        Position = apex,
-                        Color = new Vector3((float)Math.Clamp(cr, 0, 255), (float)Math.Clamp(cg, 0, 255), (float)Math.Clamp(cb, 0, 255)),
-                        Level = 1024,
-                        Radius = (int)Math.Round(fittedR),
-                        Style = 0,
-                        Normal = n,
-                    });
+                        var w = fd.World[(tx, ty)];
+                        ccx += w.X; ccy += w.Y; ccz += w.Z;
+                    }
+                    comp.Centroid = new Vector3((float)(ccx / comp.Texels.Count), (float)(ccy / comp.Texels.Count), (float)(ccz / comp.Texels.Count));
+                    allComponents.Add(comp);
                 }
             }
 
-            // dedupe: keep strong, well-separated pools only. Within
-            // MinSpacing the fields become near-collinear bases, which is
-            // exactly the failure mode v40 documented (sw_01 proven good
-            // alone, dropped in multi-light runs because greedy absorbs its
-            // signal). Keeping one bright pool per loose cluster keeps the
-            // bases distinct.
+            if (allComponents.Count == 0) return seeds;
+
+            // ---- 3. cross-face union-find clustering (60u) ----
+            var parent = new int[allComponents.Count];
+            for (int i = 0; i < parent.Length; i++) parent[i] = i;
+            int Find(int a)
+            {
+                while (parent[a] != a) { parent[a] = parent[parent[a]]; a = parent[a]; }
+                return a;
+            }
+            void Union(int a, int b)
+            {
+                int ra = Find(a), rb = Find(b);
+                if (ra != rb) parent[rb] = ra;
+            }
+            for (int i = 0; i < allComponents.Count; i++)
+            for (int j = i + 1; j < allComponents.Count; j++)
+            {
+                var a = allComponents[i].Centroid; var b = allComponents[j].Centroid;
+                double d2 = (a.X - b.X) * (a.X - b.X) + (a.Y - b.Y) * (a.Y - b.Y) + (a.Z - b.Z) * (a.Z - b.Z);
+                if (d2 < CLUSTER_DIST * CLUSTER_DIST) Union(i, j);
+            }
+            var clusters = new Dictionary<int, List<int>>();
+            for (int i = 0; i < allComponents.Count; i++)
+            {
+                int root = Find(i);
+                if (!clusters.TryGetValue(root, out var lst)) { lst = new List<int>(); clusters[root] = lst; }
+                lst.Add(i);
+            }
+
+            // ---- 4. fit each cluster (strip-split first) ----
+            var keptSeeds = new List<GeneratedSeed>();
+            var faceByIndex = faceData.ToDictionary(f2 => f2.FaceIndex);
+            var clusterList = clusters.Values
+                .OrderByDescending(cluster => cluster.Sum(ci =>
+                    allComponents[ci].Texels.Sum(t => faceByIndex[allComponents[ci].FaceIndex].Bright[t])))
+                .ToList();
+
+            foreach (var cluster in clusterList)
+            {
+                if (keptSeeds.Count >= MaxSeeds) break;
+                var pts = new List<ClusterPoint>();
+                foreach (var ci in cluster)
+                {
+                    var comp = allComponents[ci];
+                    var fd = faceByIndex[comp.FaceIndex];
+                    foreach (var (tx, ty) in comp.Texels)
+                        pts.Add(new ClusterPoint(fd.World[(tx, ty)], fd.Bright[(tx, ty)], fd.Rgb[(tx, ty)], fd.Normal));
+                    foreach (var (tx, ty) in comp.DimTail)
+                        pts.Add(new ClusterPoint(fd.World[(tx, ty)], fd.Bright[(tx, ty)], fd.Rgb[(tx, ty)], fd.Normal));
+                }
+                if (pts.Count < 2) continue;
+
+                var subClusters = new List<(List<ClusterPoint> pts, string tag)>();
+                splitCluster(pts, "c", 0, subClusters);
+
+                foreach (var (subPts, tag) in subClusters)
+                {
+                    if (keptSeeds.Count >= MaxSeeds) break;
+                    var seed = FitCluster(subPts, tag);
+                    if (seed != null) keptSeeds.Add(seed);
+                }
+            }
+
+            // ---- 5. dedupe by 0.6*min(radius) separation ----
             var deduped = new List<GeneratedSeed>();
-            foreach (var s in seeds.OrderByDescending(s => s.Color.X + s.Color.Y + s.Color.Z))
+            foreach (var s in keptSeeds.OrderByDescending(s => s.Color.X + s.Color.Y + s.Color.Z))
             {
                 bool dup = false;
                 foreach (var kept in deduped)
                 {
-                    if (Vector3.Distance(kept.Position, s.Position) < MinSpacing) { dup = true; break; }
+                    double minR = Math.Min(s.Radius, kept.Radius);
+                    if (Vector3.Distance(kept.Position, s.Position) < 0.6 * minR) { dup = true; break; }
                 }
                 if (!dup) deduped.Add(s);
                 if (deduped.Count >= MaxSeeds) break;
             }
+            for (int i = 0; i < deduped.Count; i++) deduped[i].Name = $"lm_{i}";
             return deduped;
+        }
+
+        /// <summary>Strip split: split a cluster's core along its major axis at the
+        /// median when extent &gt; StripMinExtent AND aspect &gt; StripMinAspect.</summary>
+        private static void splitCluster(List<ClusterPoint> pts, string tag, int depth,
+            List<(List<ClusterPoint>, string)> outList)
+        {
+            if (depth >= 4) { outList.Add((pts, tag)); return; }
+            var core = pts.Where(p => p.B >= T_CORE).ToList();
+            if (core.Count < MIN_CORE) { outList.Add((pts, tag)); return; }
+            double extX = core.Max(p => p.World.X) - core.Min(p => p.World.X);
+            double extY = core.Max(p => p.World.Y) - core.Min(p => p.World.Y);
+            double extZ = core.Max(p => p.World.Z) - core.Min(p => p.World.Z);
+            var ext = new[] { (index: 0, value: extX), (index: 1, value: extY), (index: 2, value: extZ) }
+                .OrderByDescending(e => e.value).ToArray();
+            double se0 = ext[0].value, se1 = ext[1].value;
+            if (se0 > StripMinExtent && se0 > StripMinAspect * Math.Max(50.0, se1))
+            {
+                int axis = ext[0].index;
+                double med = core.Select(p => p.World[axis]).OrderBy(v => v).ElementAt(core.Count / 2);
+                var a = pts.Where(p => p.World[axis] <= med).ToList();
+                var b = pts.Where(p => p.World[axis] > med).ToList();
+                int coreA = a.Count(p => p.B >= T_CORE);
+                int coreB = b.Count(p => p.B >= T_CORE);
+                if (coreA >= MIN_CORE) splitCluster(a, tag + "a", depth + 1, outList);
+                if (coreB >= MIN_CORE) splitCluster(b, tag + "b", depth + 1, outList);
+                if (coreA < MIN_CORE && coreB < MIN_CORE) outList.Add((pts, tag));
+                return;
+            }
+            outList.Add((pts, tag));
+        }
+
+        /// <summary>Fit one (possibly split) cluster to a seed. Returns null if the
+        /// fit fails (corr/L gate) or the post-fit split fires with no viable half.</summary>
+        private static GeneratedSeed? FitCluster(List<ClusterPoint> pts, string tag)
+        {
+            var core = pts.Where(p => p.B >= T_CORE).ToList();
+            if (core.Count < MIN_CORE) return null;
+
+            var centroid = new Vector3(
+                (float)core.Average(p => p.World.X),
+                (float)core.Average(p => p.World.Y),
+                (float)core.Average(p => p.World.Z));
+
+            // dominant normal: vote the axis-dominant sign pattern over the core
+            var votes = new Dictionary<(int, int, int), (double w, Vector3 sum)>();
+            foreach (var p in core)
+            {
+                var n = p.FaceNormal;
+                var key = ((int)Math.Sign(n.X), (int)Math.Sign(n.Y), (int)Math.Sign(n.Z));
+                if (!votes.TryGetValue(key, out var cur)) votes[key] = (1.0, n);
+                else votes[key] = (cur.w + 1.0, cur.sum + n);
+            }
+            var best = votes.OrderByDescending(kv => kv.Value.w).First().Value;
+            var apexNormal = Vector3.Normalize(best.sum);
+            if (apexNormal.LengthSquared() < 0.25f)
+                apexNormal = pts[0].FaceNormal.LengthSquared() >= 0.25f ? pts[0].FaceNormal : Vector3.UnitZ;
+
+            double x = centroid.X + apexNormal.X * InitHeight;
+            double y = centroid.Y + apexNormal.Y * InitHeight;
+            double z = centroid.Z + apexNormal.Z * InitHeight;
+            var ds = core.Select(p => Dist3D(p.World, x, y, z)).OrderBy(v => v).ToList();
+            double p85 = ds[(int)(0.85 * (ds.Count - 1))];
+            double R = Math.Min(MaxRadius, Math.Max(MinRadius, 1.15 * p85));
+
+            // ambient floor estimate: median dim-tail brightness
+            var dim = pts.Where(p => p.B <= T_BRIGHT).Select(p => p.B).OrderBy(v => v).ToList();
+            double floor = dim.Count > 0 ? dim[dim.Count / 2] : 0.0;
+
+            double err;
+            double L;
+            (err, L) = ErrOf(pts, x, y, z, R, floor);
+            for (int step = 0; step < 8; step++)
+            {
+                double s = new[] { 96.0, 48.0, 24.0, 12.0, 6.0, 3.0, 1.5, 0.75 }[step];
+                bool improved = true;
+                while (improved)
+                {
+                    improved = false;
+                    for (int ax = 0; ax < 3; ax++)
+                    for (int sgn = -1; sgn <= 1; sgn += 2)
+                    {
+                        var (nx, ny, nz) = (x, y, z);
+                        if (ax == 0) nx += sgn * s;
+                        if (ax == 1) ny += sgn * s;
+                        if (ax == 2) nz += sgn * s;
+                        double dcx = nx - centroid.X, dcy = ny - centroid.Y, dcz = nz - centroid.Z;
+                        if (dcx * dcx + dcy * dcy + dcz * dcz > 500.0 * 500.0) continue;
+                        var (e2, L2) = ErrOf(pts, nx, ny, nz, R, floor);
+                        if (e2 < err - 0.1) { x = nx; y = ny; z = nz; err = e2; L = L2; improved = true; }
+                    }
+                    foreach (var fR in new[] { 1.15, 0.87 })
+                    {
+                        double R2 = Math.Min(MaxRadius, Math.Max(MinRadius, R * fR));
+                        if (Math.Abs(R2 - R) < 0.5) continue;
+                        var (e2, L2) = ErrOf(pts, x, y, z, R2, floor);
+                        if (e2 < err - 0.1) { R = R2; err = e2; L = L2; improved = true; }
+                    }
+                }
+            }
+
+            // correlation of the fitted model vs the core texels
+            double mT = core.Average(p => p.B);
+            double mM = core.Average(p => L * Falloff(Dist3D(p.World, x, y, z), R));
+            double num = 0, denT = 0, denM = 0;
+            foreach (var p in core)
+            {
+                double mVal = L * Falloff(Dist3D(p.World, x, y, z), R);
+                double tDev = p.B - mT;
+                double mDev = mVal - mM;
+                num += tDev * mDev; denT += tDev * tDev; denM += mDev * mDev;
+            }
+            double corr = num / (Math.Sqrt(denT * denM) + 1e-9);
+
+            var dsFit = core.Select(p => Dist3D(p.World, x, y, z)).OrderBy(v => v).ToList();
+            double p95 = dsFit[Math.Min(dsFit.Count - 1, (int)(0.95 * dsFit.Count))];
+
+            if (corr >= KeepCorr && L >= KeepL)
+            {
+                int topN = Math.Max(1, core.Count / 20);
+                var top = core.OrderByDescending(p => p.B).Take(topN).ToArray();
+                var avg = top.Aggregate(new Vector3(0, 0, 0), (a, p) => a + p.Rgb) / top.Length;
+                return new GeneratedSeed
+                {
+                    Position = new Vector3((float)x, (float)y, (float)z),
+                    Color = new Vector3((float)Math.Clamp(avg.X, 0, 255), (float)Math.Clamp(avg.Y, 0, 255), (float)Math.Clamp(avg.Z, 0, 255)),
+                    Level = (int)Math.Round(L),
+                    Radius = (int)Math.Round(Math.Max(R, MinRadius)),
+                    Normal = apexNormal,
+                    Style = 0,
+                };
+            }
+
+            // post-fit split: multi-pool core
+            if (p95 > 1.6 * R)
+            {
+                var ext = new[] {
+                    (ext: core.Max(p => p.World.X) - core.Min(p => p.World.X), axis: 0),
+                    (ext: core.Max(p => p.World.Y) - core.Min(p => p.World.Y), axis: 1),
+                    (ext: core.Max(p => p.World.Z) - core.Min(p => p.World.Z), axis: 2),
+                }.OrderByDescending(e => e.ext).First();
+                double med = core.Select(p => p.World[ext.axis]).OrderBy(v => v).ElementAt(core.Count / 2);
+                var a = pts.Where(p => p.World[ext.axis] <= med).ToList();
+                var b = pts.Where(p => p.World[ext.axis] > med).ToList();
+                if (a.Count(p => p.B >= T_CORE) >= MIN_CORE) return FitCluster(a, tag + "a");
+                if (b.Count(p => p.B >= T_CORE) >= MIN_CORE) return FitCluster(b, tag + "b");
+            }
+            return null;
+        }
+
+        private static double Dist3D(Vector3 w, double x, double y, double z)
+            => Math.Sqrt((w.X - x) * (w.X - x) + (w.Y - y) * (w.Y - y) + (w.Z - z) * (w.Z - z));
+
+        private static double Falloff(double d, double R)
+        {
+            if (d <= 0) return 1.0;
+            if (d >= R) return 0.0;
+            return Math.Max(0.0, 1.0 - (d * d) / (R * R));
+        }
+
+        private static (double err, double L) ErrOf(List<ClusterPoint> pts, double x, double y, double z, double R, double floor)
+        {
+            double sumNum = 0, sumDen = 0;
+            foreach (var p in pts)
+            {
+                double d = Dist3D(p.World, x, y, z);
+                double f = Falloff(d, R);
+                if (f <= 0) continue;
+                sumNum += f * (p.B - floor);
+                sumDen += f * f;
+            }
+            double L = sumDen > 1e-9 ? Math.Max(0.0, sumNum / sumDen) : 0.0;
+            double err = 0;
+            foreach (var p in pts)
+            {
+                double d = Dist3D(p.World, x, y, z);
+                double f = Falloff(d, R);
+                double pred = floor + L * f;
+                err += Math.Abs(p.B - pred);
+            }
+            return (err, L);
         }
 
         /// <summary>Serialize seeds to the external-seeds JSON format (same shape the
