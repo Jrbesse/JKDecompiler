@@ -2337,18 +2337,20 @@ namespace JKDecompiler.Core
                 double rmsWithout = RmsOf1D(pairs, basis, g2, ambientExt);
                 lights[l].DeltaE = rmsWithout - rmsFit;   // > 0 = the light helps
             }
+            // 6. pruning: the joint NNLS already gives a dead seed (no signal
+            // anywhere) scale exactly 0 — drop those. Everything else is
+            // kept: dropping lights on a marginal ΔE / low-share criterion
+            // zeroed every light of a deep collinear wall band (the joint
+            // fit assigns each a small scale that is real signal; the old
+            // per-light gate killed them all — academy1 default path, kept=0
+            // 2026-11-26). The stage-A gate below is the honest final check.
             for (int l = 0; l < nL; l++)
             {
                 if (!lights[l].Kept) continue;
-                if (lights[l].DeltaE < 0 && lights[l].ContributionPct < Options.MinContributionPct)
+                if (gscales[l] <= 0)
                 {
                     lights[l].Kept = false;
-                    lights[l].DropReason = $"no benefit: ΔE={lights[l].DeltaE:F2}, contribution {lights[l].ContributionPct:F2}%";
-                }
-                else if (lights[l].ContributionPct < Options.MinContributionPct && lights[l].DeltaE < Options.MinDeltaEPct)
-                {
-                    lights[l].Kept = false;
-                    lights[l].DropReason = $"negligible: ΔE={lights[l].DeltaE:F2} (<{Options.MinDeltaEPct}), contribution {lights[l].ContributionPct:F2}%";
+                    lights[l].DropReason = "dead seed: zero joint NNLS scale";
                 }
             }
 
