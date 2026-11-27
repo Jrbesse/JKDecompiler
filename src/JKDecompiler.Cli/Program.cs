@@ -25,6 +25,7 @@ static class RunCli
                 case "convert-dir": return ConvertDir(args);
                 case "recover-lights": return RecoverLights(args);
                 case "fit-lights": return FitLights(args);
+                case "mkseeds": return MkSeeds(args);
                 default: PrintUsage(); return 2;
             }
         }
@@ -206,7 +207,8 @@ static class RunCli
         {
             Console.Error.WriteLine("usage: jkdecompiler fit-lights <orig.bsp> <base.map> <q3map2-binary> <game-dir> <outdir> [scratch-dir]");
             Console.Error.WriteLine("  M2.5 stage 2: closed-loop fit of recovered lights against the baked lightmap");
-            Console.Error.WriteLine("  options: [--max-seeds N] [--seeds FILE] [--parallel N] [--no-posfit] [--no-radfit] [--pos-step F] [--jka-format] [--lm-size N] [--sky-value N] [--sun-intensity N] [--sun-degrees F] [--sun-elevation F]");
+            Console.Error.WriteLine("  options: [--max-seeds N] [--seeds FILE] [--stage1] [--parallel N] [--no-posfit] [--no-radfit] [--pos-step F] [--jka-format] [--lm-size N] [--sky-value N] [--sun-intensity N] [--sun-degrees F] [--sun-elevation F]");
+            Console.Error.WriteLine("  seeds: default = lightmap-derived (LightmapSeedGenerator); --seeds FILE = external seeds (same format); --stage1 = grid recovery (legacy, opt-in).");
             return 2;
         }
         if (!File.Exists(pos[1]))
@@ -230,6 +232,7 @@ static class RunCli
             SunDegrees = OptF(args, "--sun-degrees", 120f),
             SunElevation = OptF(args, "--sun-elevation", 40f),
             SeedsPath = OptS(args, "--seeds"),
+            UseGridStage1 = args.Any(a => a == "--stage1"),
         });
         string mapLabel = Path.GetFileNameWithoutExtension(pos[0]);
         Console.WriteLine($"=> {mapLabel}: fitting lights against baked lightmap blocks ({pos[2]})");
@@ -352,6 +355,34 @@ static class RunCli
         return $"{status} {name}: {orig} {map} {r.Warnings.Count} warning(s) {r.ElapsedMs}ms";
     }
 
+    /// <summary>
+    /// M2.5 seed derivation — lightmap-derived candidate lights from the baked
+    /// lightmap blocks (the fit's default seed path). Writes the external-seeds
+    /// JSON to <c>&lt;outdir&gt;/seeds.json</c> so it can be reused via --seeds.
+    /// </summary>
+    private static int MkSeeds(string[] args)
+    {
+        if (args.Length < 3)
+        {
+            Console.Error.WriteLine("usage: jkdecompiler mkseeds <bsp> <outdir>");
+            Console.Error.WriteLine("  M2.5: derive lightmap-derived candidate lights from the baked blocks");
+            return 2;
+        }
+        if (!File.Exists(args[1])) { Console.Error.WriteLine($"bsp not found: {args[1]}"); return 2; }
+        var d = new BspReader().Read(args[1]);
+        var seeds = LightmapSeedGenerator.Generate(d);
+        string mapLabel = Path.GetFileNameWithoutExtension(args[1]);
+        string outDir = args[2];
+        Directory.CreateDirectory(outDir);
+        string outPath = Path.Combine(outDir, "seeds.json");
+        LightmapSeedGenerator.WriteJson(seeds, mapLabel, outPath);
+        Console.WriteLine($"{mapLabel}: {seeds.Count} lightmap-derived seeds → {outPath}");
+        foreach (var s in seeds)
+            Console.WriteLine($"  {s.Name}: pos=({s.Position.X:0.#} {s.Position.Y:0.#} {s.Position.Z:0.#}) " +
+                $"r={s.Radius} color=({(int)s.Color.X} {(int)s.Color.Y} {(int)s.Color.Z})");
+        return seeds.Count > 0 ? 0 : 1;
+    }
+
     private static void PrintUsage()
     {
         Console.WriteLine("""
@@ -364,7 +395,8 @@ static class RunCli
               jkdecompiler gen-synthetic <out.bsp>   write a small valid RBSP (CI/fixture use)
               jkdecompiler convert <bsp> <q3map2> <out>     M2: q3map2 -convert -> .map + report
               jkdecompiler convert-dir <dir> <q3map2> <out> M2: batch over a .bsp directory
-              jkdecompiler recover-lights <bsp> <out>       M2.5s1: recover lights from the lightgrid
+              jkdecompiler recover-lights <bsp> <out>       M2.5s1: recover lights from the lightgrid (legacy)
+              jkdecompiler mkseeds <bsp> <outdir>         M2.5 seeds: derive lightmap-derived candidate lights
               jkdecompiler fit-lights <bsp> <map> <q3map2> <gamedir> <out> [scratch]  M2.5s2: closed-loop fit vs baked lightmap
             """);
     }
