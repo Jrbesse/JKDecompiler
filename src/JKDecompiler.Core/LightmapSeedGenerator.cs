@@ -46,15 +46,21 @@ namespace JKDecompiler.Core
         public const int MIN_CORE = 25;
         /// <summary>Strip split: extent beyond this AND aspect beyond this → split.</summary>
         public const double StripMinExtent = 500.0;
-        public const double StripMinAspect = 2.5;
+        public const double StripMinAspect = 1.5;
+        /// <summary>Equal-width segment width for the no-gap strip fallback.</summary>
+        public const double StripSegmentExtent = 650.0;
         /// <summary>Max seeds emitted.</summary>
         public const int MaxSeeds = 20;
         /// <summary>Min core corr to keep a seed.</summary>
         public const double KeepCorr = 0.65;
         /// <summary>Min fitted intensity to keep a seed.</summary>
         public const double KeepL = 30.0;
-        /// <summary>Initial apex offset along the face normal (descent moves it).</summary>
-        public const double InitHeight = 60.0;
+        /// <summary>Initial apex offset along the face normal (descent moves it).
+        /// Negative places the apex slightly BEHIND the wall — like the
+        /// measured-good 6-washer set — so the bake is concentrated near the
+        /// wall, not floating mid-room (the room-side apex lands ~0.5x the
+        /// brightness at the wall and its per-light field collapses).</summary>
+        public const double InitHeight = -40.0;
         /// <summary>Max fit radius (world units).</summary>
         public const double MaxRadius = 1200.0;
         /// <summary>Min fit radius (world units).</summary>
@@ -107,6 +113,18 @@ namespace JKDecompiler.Core
             var faces = LightFit.BuildSampleFaces(d);
             const int FaceWidth = 128;
 
+            // Global room-side reference: entities live inside the room, so the
+            // side of a face they fall on is the room. Flip each face's
+            // geometry normal to point at that side — the stored vertex normals
+            // are NOT trustworthy for this fixture (inconsistent across the
+            // wall segments) and the cross-product winding can be flipped too.
+            var entityPts = new List<Vector3>();
+            foreach (var ent in d.Entities)
+            {
+                var o = ent.Origin;
+                if (o.LengthSquared() > 0.25f) entityPts.Add(o);
+            }
+
             // ---- 1. per-face bright texel collection ----
             var faceData = new List<FaceData>();
             foreach (var sf in faces)
@@ -149,19 +167,21 @@ namespace JKDecompiler.Core
                         (float)(o.Z + fu.Z * x + fv.Z * y));
                 }
 
-                // stored vertex normal average (authoritative), fallback cross product
-                var f = d.Faces[sf.FaceIndex];
-                Vector3 n = Vector3.Zero; int nUsed = 0;
-                for (int v = 0; v < f.NumVertices; v++)
+                // Geometry cross-product normal, flipped to face the room side.
+                var n = Vector3.Normalize(new Vector3((float)sf.Normal.X, (float)sf.Normal.Y, (float)sf.Normal.Z));
+                if (entityPts.Count > 0)
                 {
-                    var idx = f.FirstVertexIndex + v;
-                    if (idx < 0 || idx >= d.Vertices.Count) continue;
-                    var vn = d.Vertices[idx].Normal;
-                    if (vn.LengthSquared() < 0.25f) continue;
-                    n += vn; nUsed++;
+                    // signed distance of each entity from this face's plane
+                    Vector3 fc = new Vector3((float)sf.Center.X, (float)sf.Center.Y, (float)sf.Center.Z);
+                    int pos = 0, neg = 0;
+                    foreach (var e in entityPts)
+                    {
+                        double dist = (e.X - fc.X) * n.X + (e.Y - fc.Y) * n.Y + (e.Z - fc.Z) * n.Z;
+                        if (dist > 0) pos++; else if (dist < 0) neg++;
+                    }
+                    // the room side is the side with more entities; flip if needed
+                    if (neg > pos) n = -n;
                 }
-                if (nUsed > 0) n = Vector3.Normalize(n);
-                else n = Vector3.Normalize(new Vector3((float)sf.Normal.X, (float)sf.Normal.Y, (float)sf.Normal.Z));
 
                 var fd = new FaceData { FaceIndex = sf.FaceIndex, Normal = n };
                 for (int ty = ty0; ty <= ty1; ty++)
@@ -366,6 +386,23 @@ namespace JKDecompiler.Core
                         outList.Add((b, tag + "b"));
                     return;
                 }
+                // Fallback: no meaningful gap — split the strip at equal-width
+                // segments (e.g. a long wall band with no inter-pool void).
+                int nSeg = Math.Max(2, (int)Math.Ceiling(span / StripSegmentExtent));
+                double segW = span / nSeg;
+                double lo = sorted.First().World[axis];
+                for (int i = 0; i < nSeg; i++)
+                {
+                    double segLo = lo + i * segW;
+                    double segHi = (i == nSeg - 1) ? lo + span : lo + (i + 1) * segW;
+                    var seg = pts.Where(p => p.World[axis] >= segLo && p.World[axis] <= segHi).ToList();
+                    if (seg.Count == 0) continue;
+                    if (seg.Count(p => p.B >= T_CORE) >= MIN_CORE)
+                        splitCluster(seg, $"{tag}s{i}", depth + 1, outList);
+                    else
+                        outList.Add((seg, $"{tag}s{i}"));
+                }
+                return;
             }
             outList.Add((pts, tag));
         }
@@ -426,6 +463,14 @@ namespace JKDecompiler.Core
                         if (ax == 2) nz += sgn * s;
                         double dcx = nx - centroid.X, dcy = ny - centroid.Y, dcz = nz - centroid.Z;
                         if (dcx * dcx + dcy * dcy + dcz * dcz > 500.0 * 500.0) continue;
+                        // Keep the apex within a tight band around the face
+                        // plane (InitHeight .. -2*InitHeight, i.e. behind the
+                        // wall up to ~2x that into the room): close enough that
+                        // the sphere model stays meaningful, but not so far
+                        // into the room that the field covers too much of the
+                        // floor and the joints collapse.
+                        double projN = dcx * apexNormal.X + dcy * apexNormal.Y + dcz * apexNormal.Z;
+                        if (projN < InitHeight || projN > -2.0 * InitHeight) continue;
                         var (e2, L2) = ErrOf(pts, nx, ny, nz, R, floor);
                         if (e2 < err - 0.1) { x = nx; y = ny; z = nz; err = e2; L = L2; improved = true; }
                     }
@@ -455,16 +500,35 @@ namespace JKDecompiler.Core
             var dsFit = core.Select(p => Dist3D(p.World, x, y, z)).OrderBy(v => v).ToList();
             double p95 = dsFit[Math.Min(dsFit.Count - 1, (int)(0.95 * dsFit.Count))];
 
-            if (corr >= KeepCorr && L >= KeepL)
+
+            // Wide wall-band-type segments: the single-sphere model cannot fit
+            // a 2-wide strip (see the control washers — 6 per wall with R=900),
+            // so let these through and let the fit-lights pipeline (joint NNLS
+            // + posfit) decide. Narrow pools still go through the corr gate.
+            double segExtX = core.Count > 0 ? core.Max(p => p.World.X) - core.Min(p => p.World.X) : 0.0;
+            double segExtZ = core.Count > 0 ? core.Max(p => p.World.Z) - core.Min(p => p.World.Z) : 0.0;
+            double segExt = Math.Max(segExtX, segExtZ);
+            bool wideSegment = segExt > 500.0 && core.Count >= 3 * MIN_CORE;
+            if (wideSegment || (corr >= KeepCorr && L >= KeepL))
             {
                 int topN = Math.Max(1, core.Count / 20);
                 var top = core.OrderByDescending(p => p.B).Take(topN).ToArray();
                 var avg = top.Aggregate(new Vector3(0, 0, 0), (a, p) => a + p.Rgb) / top.Length;
+                // Color stays as 0..1 ratios (max = 1); level matches the
+                // control convention (level/255 ≈ initial bake intensity).
+                // The loader turns this into Scale = level * color / 255 —
+                // baking with a 0..255 color and a raw Level (e.g. 245) made
+                // every single-light field ~500x too bright and the joint NNLS
+                // collapsed to 0 on every seed.
+                double cmax = Math.Max(avg.X, Math.Max(avg.Y, avg.Z));
+                var colorOut = cmax > 1e-9
+                    ? new Vector3((float)(avg.X / cmax), (float)(avg.Y / cmax), (float)(avg.Z / cmax))
+                    : new Vector3(1f, 1f, 1f);
                 return new GeneratedSeed
                 {
                     Position = new Vector3((float)x, (float)y, (float)z),
-                    Color = new Vector3((float)Math.Clamp(avg.X, 0, 255), (float)Math.Clamp(avg.Y, 0, 255), (float)Math.Clamp(avg.Z, 0, 255)),
-                    Level = (int)Math.Round(L),
+                    Color = colorOut,
+                    Level = 128,
                     Radius = (int)Math.Round(Math.Max(R, MinRadius)),
                     Normal = apexNormal,
                     Style = 0,
