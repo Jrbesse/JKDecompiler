@@ -134,6 +134,7 @@ namespace JKDecompiler.Core
         public int LevelMax = 12000;
         public int MaxPeels = 48;              // max lights peeled from one supercluster
         public int RansacTrials = 64;          // random ray-triple lock-on attempts per apex
+        public int MaxSeeds = 0;               // 0 = accept all; >0 = keep only the best-N seeds by quality
 
         private struct Sample
         {
@@ -312,6 +313,19 @@ namespace JKDecompiler.Core
                 SolveCluster(clusterList[id], id, res, mapExtent);
 
             AbsorbVirtualApexes(res);
+
+            // Quality gate: order seeds best-first by the same metric stage 2
+            // uses (level consistency, forward-ray fraction, evidence size)
+            // and keep only the top MaxSeeds when the caller asks for one.
+            res.Lights = res.Lights
+                .OrderBy(l => l.LevelConsistency)
+                .ThenByDescending(l => l.TPositiveFrac)
+                .ThenByDescending(l => l.CellCount)
+                .ToList();
+            if (MaxSeeds > 0 && res.Lights.Count > MaxSeeds)
+                res.Lights = res.Lights.Take(MaxSeeds).ToList();
+            for (int i = 0; i < res.Lights.Count; i++)
+                res.Lights[i].Name = $"recov_{i}";
 
             return res;
         }

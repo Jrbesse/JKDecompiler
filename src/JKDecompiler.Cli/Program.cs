@@ -264,10 +264,10 @@ static class RunCli
     /// </summary>
     private static int RecoverLights(string[] args)
     {
-        var pos = SplitPositional(args, new[] { "--min-cells", "--max-ray-dist", "--directed-min" });
+        var pos = SplitPositional(args, new[] { "--min-cells", "--max-ray-dist", "--directed-min", "--max-seeds" });
         if (pos.Length < 2)
         {
-            Console.Error.WriteLine("usage: jkdecompiler recover-lights <bsp> <outdir> [--min-cells N] [--max-ray-dist F] [--directed-min F]");
+            Console.Error.WriteLine("usage: jkdecompiler recover-lights <bsp> <outdir> [--min-cells N] [--max-ray-dist F] [--directed-min F] [--max-seeds N]");
             Console.Error.WriteLine("  M2.5 stage 1: grid seeding — recover light entities from the baked lightgrid");
             return 2;
         }
@@ -277,6 +277,7 @@ static class RunCli
             MinCells = OptI(args, "--min-cells", 6),
             MaxRayDist = OptF(args, "--max-ray-dist", 32f),
             DirectedMin = OptF(args, "--directed-min", 5f),
+            MaxSeeds = OptI(args, "--max-seeds", 0),
         };
         var r = lr.Recover(d);
 
@@ -340,6 +341,8 @@ static class RunCli
         foreach (var rc in r.Rejected)
             Console.WriteLine($"  rejected: {rc.CellCount} cells — {rc.Reason}");
         Console.WriteLine($"accepted {r.Lights.Count}/{r.Lights.Count + r.Rejected.Count} clusters");
+        if (lr.MaxSeeds > 0)
+            Console.WriteLine($"  quality-gated to the best {r.Lights.Count} seeds (--max-seeds {lr.MaxSeeds})");
         Console.WriteLine($"wrote recovered_lights.map + recovered_lights_overlay.png + recovered_lights.json to {Path.GetFullPath(pos[1])}");
         return 0;
     }
