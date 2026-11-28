@@ -1,0 +1,34 @@
+title: JKDecompiler
+description: "A high-fidelity decompiler for Star Wars Jedi Knight: Jedi Academy map files (.bsp)."
+remote_theme: pages-themes/dinky@v0.2.0
+plugins:
+  - jekyll-remote-theme
+
+url: "https://jbesse.me"
+baseurl: "/JKDecompiler"
+
+markdown: kramdown
+highlighter: rouge
+
+kramdown:
+  input: GFM
+  syntax_highlighter: rouge
+
+nav_pages:
+  - title: Home
+    url: /
+  - title: Dev log
+    url: /devlog/
+
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default
+
+# This is a dev log, not a mirror of the repository's working documents.
+# Everything below stays in the repo and off the public site.
+exclude:
+  - M2.5-ACCEPTANCE.md
+  - M2.5-SP-VALIDATION.md
+  - README.md

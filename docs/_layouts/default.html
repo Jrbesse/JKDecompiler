@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="{{ site.lang | default: "en-US" }}">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+{% seo %}
+    <link rel="stylesheet" href="{{ '/assets/css/style.css?v=' | append: site.github.build_revision | relative_url }}">
+    <script src="{{ '/assets/js/scale.fix.js' | relative_url }}"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    {% include head-custom.html %}
+  </head>
+  <body>
+    <div class="wrapper">
+      <header>
+        <h1><a href="{{ "/" | relative_url }}">{{ site.title | default: site.github.repository_name }}</a></h1>
+        <p>{{ site.description | default: site.github.project_tagline }}</p>
+
+        <nav>
+          <ul>
+            {% for link in site.nav_pages %}
+              <li><a href="{{ link.url | relative_url }}">{{ link.title }}</a></li>
+            {% endfor %}
+
+            <hr>
+
+            <p><strong>Recent entries</strong></p>
+            {% for post in site.posts limit:5 %}
+              <li><a href="{{ post.url | relative_url }}">{{ post.title }}</a></li>
+            {% endfor %}
+          </ul>
+        </nav>
+
+        {% if site.github.is_project_page %}
+          <p class="header">This project is maintained by <a class="header name" href="{{ site.github.owner_url }}">{{ site.github.owner_name }}</a></p>
+        {% endif %}
+      </header>
+
+      <section>
+        {{ content }}
+        <footer class="site-note">
+          <p>JKDecompiler is a high-fidelity decompiler for Jedi Knight: Jedi Academy map files (.bsp).
+          It contains nothing extracted from, or authored by, the original game.</p>
+        </footer>
+      </section>
+
+    </div>
+  </body>
+</html>

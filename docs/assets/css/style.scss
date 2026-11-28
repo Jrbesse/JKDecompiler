@@ -1,0 +1,46 @@
+---
+---
+
+@import "{{ site.theme }}";
+
+/* Target the links inside your recent posts list */
+ul li a {
+  display: block;
+  white-space: nowrap;     /* Prevents text from wrapping to a new line */
+  overflow: hidden;        /* Hides the text that spills out */
+  text-overflow: ellipsis; /* Adds the "..." automatically */
+  max-width: 180px;        /* Adjust this to match your button width */
+}
+
+/* Target the sidebar or menu list items */
+#sidebar ul li a {
+  display: block;           /* Necessary for width and overflow to work */
+  width: 100%;              /* Forces it to match the sidebar/button width */
+  max-width: 150px;         /* Match this to your theme's sidebar width */
+  white-space: nowrap;      /* Keeps text on one single line */
+  overflow: hidden;         /* Hides the text that spills out */
+  text-overflow: ellipsis;  /* Adds the '...' */
+  box-sizing: border-box;   /* Includes padding in the width calculation */
+}
+
+/* The theme pins <footer> to the bottom-left of the wrapper, which lands on top of the article.
+   This footer is part of the page, not a fixed badge. */
+footer.site-note {
+  position: static;
+  width: auto;
+  margin-top: 3em;
+  padding-top: 1em;
+  border-top: 1px solid #e8e8e8;
+  font-size: 12px;
+  line-height: 1.5;
+}
+footer.site-note p { margin: 0; }
+
+/* Long source lines scroll inside their block instead of being clipped at the column edge. */
+.highlight pre { overflow-x: auto; }
+
+/* Source listings wrap rather than run under the column edge: nothing to discover by scrolling. */
+.highlight pre { white-space: pre-wrap; word-break: break-word; }
+
+/* The header is 270px wide; OpenSimAnt at the theme's default size clips at the edge. */
+.wrapper > header h1 { font-size: 26px; }
